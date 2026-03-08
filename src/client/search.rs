@@ -8,6 +8,8 @@ pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    #[serde(default)]
+    pub is_fallback: bool,
 }
 
 #[async_trait]
@@ -96,6 +98,7 @@ impl SearchClient for TavilyClient {
                                 title: r.title,
                                 url: r.url,
                                 snippet: r.content,
+                                is_fallback: false,
                             })
                             .collect());
                     }
@@ -113,6 +116,40 @@ impl SearchClient for TavilyClient {
         }
 
         Err(last_err.unwrap_or_else(|| AppError::SearchClient("unknown error".to_string())))
+    }
+}
+
+pub struct FallbackSearchClient {
+    clients: Vec<Box<dyn SearchClient>>,
+}
+
+impl FallbackSearchClient {
+    pub fn new(clients: Vec<Box<dyn SearchClient>>) -> Self {
+        Self { clients }
+    }
+}
+
+#[async_trait]
+impl SearchClient for FallbackSearchClient {
+    async fn search(&self, query: &str) -> Result<Vec<SearchResult>, AppError> {
+        let mut last_err = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client.search(query).await {
+                Ok(mut results) => {
+                    if i > 0 {
+                        for r in &mut results {
+                            r.is_fallback = true;
+                        }
+                    }
+                    return Ok(results);
+                }
+                Err(e) => {
+                    tracing::warn!("Search client at index {} failed: {}", i, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AppError::SearchClient("All search clients failed".to_string())))
     }
 }
 
@@ -169,6 +206,7 @@ pub mod tests {
             title: "Rust docs".into(),
             url: "https://doc.rust-lang.org".into(),
             snippet: "The Rust programming language".into(),
+            is_fallback: false,
         }];
         let client = MockSearchClient::new(vec![results.clone()]);
 
@@ -183,6 +221,7 @@ pub mod tests {
             title: "Result".into(),
             url: "https://example.com".into(),
             snippet: "example".into(),
+            is_fallback: false,
         }];
         let client = MockSearchClient::new(vec![results]).with_failures(2);
 
@@ -197,5 +236,53 @@ pub mod tests {
     async fn mock_search_exhausted_returns_error() {
         let client = MockSearchClient::new(vec![]);
         assert!(client.search("test").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_search_client_success_first() {
+        let client1 = MockSearchClient::new(vec![vec![SearchResult {
+            title: "1".into(),
+            url: "1".into(),
+            snippet: "1".into(),
+            is_fallback: false,
+        }]]);
+        let client2 = MockSearchClient::new(vec![vec![SearchResult {
+            title: "2".into(),
+            url: "2".into(),
+            snippet: "2".into(),
+            is_fallback: false,
+        }]]);
+        
+        let fallback = FallbackSearchClient::new(vec![Box::new(client1), Box::new(client2)]);
+        let res = fallback.search("test").await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].title, "1");
+        assert!(!res[0].is_fallback);
+    }
+
+    #[tokio::test]
+    async fn fallback_search_client_success_second() {
+        let client1 = MockSearchClient::new(vec![]).with_failures(1);
+        let client2 = MockSearchClient::new(vec![vec![SearchResult {
+            title: "2".into(),
+            url: "2".into(),
+            snippet: "2".into(),
+            is_fallback: false,
+        }]]);
+        
+        let fallback = FallbackSearchClient::new(vec![Box::new(client1), Box::new(client2)]);
+        let res = fallback.search("test").await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].title, "2");
+        assert!(res[0].is_fallback);
+    }
+
+    #[tokio::test]
+    async fn fallback_search_client_all_fail() {
+        let client1 = MockSearchClient::new(vec![]).with_failures(1);
+        let client2 = MockSearchClient::new(vec![]).with_failures(1);
+        
+        let fallback = FallbackSearchClient::new(vec![Box::new(client1), Box::new(client2)]);
+        assert!(fallback.search("test").await.is_err());
     }
 }

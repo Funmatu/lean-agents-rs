@@ -45,6 +45,51 @@ impl Engine {
         }
     }
 
+    /// Handle escalation: generate a single task_id, register it in the DashMap,
+    /// emit events, and block until human intervention is received.
+    async fn handle_escalation(
+        context: &mut ContextGraph,
+        tx: &mpsc::Sender<EngineEvent>,
+        active_interventions: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<(String, WorkflowState)>>>,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        // 1. Generate a single task_id, create the channel, and register in DashMap
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let (intervene_tx, mut intervene_rx) = mpsc::channel(1);
+        active_interventions.insert(task_id.clone(), intervene_tx);
+
+        // 2. Transition to Escalated and emit the event (with the same task_id)
+        context.transition_to(WorkflowState::Escalated)?;
+        Self::emit(tx, EngineEvent::WorkflowEscalated {
+            reason: reason.into(),
+            task_id: Some(task_id.clone()),
+        }).await;
+
+        // 3. Transition to AwaitingHumanInput
+        let from = context.state().clone();
+        context.transition_to(WorkflowState::AwaitingHumanInput)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::AwaitingHumanInput,
+        }).await;
+
+        tracing::info!("Workflow Escalated. Awaiting intervention on task_id: {}", task_id);
+
+        // 4. Block until human input arrives, then resume
+        if let Some((human_message, resume_state)) = intervene_rx.recv().await {
+            tracing::info!("Received human intervention, resuming to {:?}", resume_state);
+            context.add_message(Message::new(AgentRole::Human, &human_message));
+            let from = context.state().clone();
+            context.transition_to(resume_state.clone())?;
+            Self::emit(tx, EngineEvent::StateChanged {
+                from,
+                to: resume_state,
+            }).await;
+        }
+
+        Ok(())
+    }
+
     /// Run the full workflow engine loop, emitting EngineEvents via `tx`.
     pub async fn run(
         &self,
@@ -79,7 +124,7 @@ impl Engine {
                             }).await;
                             context.add_message(Message::new(AgentRole::Orchestrator, task));
                             info!("Engine started: Init -> Planning");
-                            Ok(())
+                            Ok(false)
                         }
                         WorkflowState::Planning => {
                             Self::emit(tx, EngineEvent::AgentThinking {
@@ -92,6 +137,7 @@ impl Engine {
                                 search,
                                 tx,
                                 cancel_token.clone(),
+                                active_interventions.clone(),
                             ).await?;
                             Self::emit(tx, EngineEvent::AgentSpoke {
                                 role: AgentRole::Orchestrator,
@@ -106,18 +152,17 @@ impl Engine {
                                 to: WorkflowState::Designing,
                             }).await;
                             info!("Planning -> Designing");
-                            Ok(())
+                            Ok(false)
                         }
                         WorkflowState::Designing => {
                             if design_iterations >= MAX_ITERATIONS {
                                 warn!("Design phase exceeded MAX_ITERATIONS, escalating");
-                                let task_id = uuid::Uuid::new_v4().to_string();
-                                context.transition_to(WorkflowState::Escalated)?;
-                                Self::emit(tx, EngineEvent::WorkflowEscalated {
-                                    reason: "Design phase exceeded max iterations".into(),
-                                    task_id: Some(task_id),
-                                }).await;
-                                return Ok(());
+                                Self::handle_escalation(
+                                    context, tx, active_interventions.clone(),
+                                    "Design phase exceeded max iterations",
+                                ).await?;
+                                design_iterations = 0;
+                                return Ok(false);
                             }
 
                             Self::emit(tx, EngineEvent::AgentThinking {
@@ -130,6 +175,7 @@ impl Engine {
                                 search,
                                 tx,
                                 cancel_token.clone(),
+                                active_interventions.clone(),
                             ).await?;
                             Self::emit(tx, EngineEvent::AgentSpoke {
                                 role: AgentRole::Architect,
@@ -147,6 +193,7 @@ impl Engine {
                                 search,
                                 tx,
                                 cancel_token.clone(),
+                                active_interventions.clone(),
                             ).await?;
                             Self::emit(tx, EngineEvent::AgentSpoke {
                                 role: AgentRole::DevilsAdvocate,
@@ -163,11 +210,11 @@ impl Engine {
                                     to: WorkflowState::Implementing,
                                 }).await;
                                 info!("Designing -> Implementing");
-                                Ok(())
+                                Ok(false)
                             } else {
                                 design_iterations += 1;
                                 info!("Design iteration {}: revision requested", design_iterations);
-                                Ok(())
+                                Ok(false)
                             }
                         }
                         WorkflowState::Implementing => {
@@ -181,6 +228,7 @@ impl Engine {
                                 search,
                                 tx,
                                 cancel_token.clone(),
+                                active_interventions.clone(),
                             ).await?;
                             Self::emit(tx, EngineEvent::AgentSpoke {
                                 role: AgentRole::Programmer,
@@ -195,18 +243,17 @@ impl Engine {
                                 to: WorkflowState::Reviewing,
                             }).await;
                             info!("Implementing -> Reviewing");
-                            Ok(())
+                            Ok(false)
                         }
                         WorkflowState::Reviewing => {
                             if review_iterations >= MAX_ITERATIONS {
                                 warn!("Review phase exceeded MAX_ITERATIONS, escalating");
-                                let task_id = uuid::Uuid::new_v4().to_string();
-                                context.transition_to(WorkflowState::Escalated)?;
-                                Self::emit(tx, EngineEvent::WorkflowEscalated {
-                                    reason: "Review phase exceeded max iterations".into(),
-                                    task_id: Some(task_id),
-                                }).await;
-                                return Ok(());
+                                Self::handle_escalation(
+                                    context, tx, active_interventions.clone(),
+                                    "Review phase exceeded max iterations",
+                                ).await?;
+                                review_iterations = 0;
+                                return Ok(false);
                             }
 
                             Self::emit(tx, EngineEvent::AgentThinking {
@@ -219,6 +266,7 @@ impl Engine {
                                 search,
                                 tx,
                                 cancel_token.clone(),
+                                active_interventions.clone(),
                             ).await?;
                             Self::emit(tx, EngineEvent::AgentSpoke {
                                 role: AgentRole::DevilsAdvocate,
@@ -236,7 +284,7 @@ impl Engine {
                                 }).await;
                                 Self::emit(tx, EngineEvent::WorkflowCompleted).await;
                                 info!("Workflow completed successfully");
-                                Ok(())
+                                Ok(false)
                             } else {
                                 let from = context.state().clone();
                                 context.transition_to(WorkflowState::Implementing)?;
@@ -246,54 +294,24 @@ impl Engine {
                                 }).await;
                                 review_iterations += 1;
                                 info!("Review iteration {}: rework requested", review_iterations);
-                                Ok(())
+                                Ok(false)
                             }
                         }
                         WorkflowState::Escalated => {
-                            // Already emitted Escalate event from previous states,
-                            // Transition automatically to AwaitingHumanInput to await HitL
-                            let _task_id = "escalated_task"; // Fallback, normally task_id is already in the event
-                            
-                            // To actually set up intervention channel and wait
-                            let (intervene_tx, mut intervene_rx) = mpsc::channel(1);
-                            
-                            // For simplicity, we create a UUID if we just entered Escalated without it
-                            // Note: the original Escalate transitions above emitted the event. 
-                            // We need to sync the active task id. Let's use a standard new one:
-                            let intervention_id = uuid::Uuid::new_v4().to_string();
-                            active_interventions.insert(intervention_id.clone(), intervene_tx);
-                            
-                            info!("Workflow Escalated. Awaiting intervention on task_id: {}", intervention_id);
-                            
-                            let from = context.state().clone();
-                            context.transition_to(WorkflowState::AwaitingHumanInput)?;
-                            Self::emit(tx, EngineEvent::StateChanged {
-                                from,
-                                to: WorkflowState::AwaitingHumanInput,
-                            }).await;
-
-                            // Wait for human input from the channel
-                            if let Some((human_message, resume_state)) = intervene_rx.recv().await {
-                                info!("Received human intervention, resuming to {:?}", resume_state);
-                                context.add_message(Message::new(AgentRole::Human, &human_message));
-                                let from = context.state().clone();
-                                context.transition_to(resume_state.clone())?;
-                                Self::emit(tx, EngineEvent::StateChanged {
-                                    from,
-                                    to: resume_state,
-                                }).await;
-                            }
-                            Ok(())
+                            // Escalation is now fully handled inline by handle_escalation().
+                            // This arm should not be reached in normal operation.
+                            warn!("Unexpected entry into Escalated match arm");
+                            Ok(true)
                         }
                         WorkflowState::AwaitingHumanInput => {
-                            // Handled within Escalated logic above to avoid loop spinning.
-                            // If we hit this state directly, we return Ok(()) for now or loop
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            Ok(())
+                            // AwaitingHumanInput is now handled inline by handle_escalation().
+                            // This arm should not be reached in normal operation.
+                            warn!("Unexpected entry into AwaitingHumanInput match arm");
+                            Ok(true)
                         }
                         WorkflowState::Completed => {
                             // Exit loop successfully
-                            return Ok::<(), AppError>(());
+                            return Ok::<bool, AppError>(true);
                         }
                         WorkflowState::ToolCalling { .. } => {
                             // This shouldn't be the top-level state evaluated here
@@ -303,8 +321,10 @@ impl Engine {
                         }
                     }
                 } => {
-                    // Propagate errors from state handling async block
-                    res?;
+                    // Propagate errors; break if the state handler signals completion
+                    if res? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -319,6 +339,7 @@ impl Engine {
         search: &dyn SearchClient,
         tx: &mpsc::Sender<EngineEvent>,
         cancel_token: tokio_util::sync::CancellationToken,
+        active_interventions: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<(String, WorkflowState)>>>,
     ) -> Result<String, AppError> {
         let current_state = context.state().clone();
         let mut tool_calls = 0u32;
@@ -341,21 +362,18 @@ impl Engine {
                             MAX_PARSE_RETRIES
                         );
                         context.clear_volatile_context();
-                        context.transition_to(WorkflowState::Escalated)?;
-                        Self::emit(tx, EngineEvent::WorkflowEscalated {
-                            reason: format!(
+                        Self::handle_escalation(
+                            context,
+                            tx,
+                            active_interventions.clone(),
+                            &format!(
                                 "Agent {:?} failed to produce valid output after {} retries",
                                 agent.role(),
                                 MAX_PARSE_RETRIES
                             ),
-                            task_id: None,
-                        }).await;
-                        return Err(AppError::Parse(format!(
-                            "agent {:?} failed to produce valid output after {} retries: {}",
-                            agent.role(),
-                            MAX_PARSE_RETRIES,
-                            e
-                        )));
+                        ).await?;
+                        parse_retries = 0;
+                        continue;
                     }
                     warn!(
                         "Agent {:?} parse error (retry {}/{}): {}",
@@ -432,7 +450,8 @@ impl Engine {
                         urls = ?results.iter().map(|r| &r.url).collect::<Vec<_>>(),
                         "Search completed"
                     );
-                    let formatted = serde_json::to_string_pretty(
+                    let is_fallback_used = results.iter().any(|r| r.is_fallback);
+                    let mut formatted = serde_json::to_string_pretty(
                         &results
                             .iter()
                             .map(|r| serde_json::json!({
@@ -443,6 +462,11 @@ impl Engine {
                             .collect::<Vec<_>>(),
                     )
                     .unwrap_or_else(|_| "[]".to_string());
+
+                    if is_fallback_used {
+                        let warning = "[System Warning] This search result is a fallback short snippet. If details are insufficient, refine your search query or proceed with current knowledge.\n\n";
+                        formatted = format!("{}{}", warning, formatted);
+                    }
 
                     context.set_volatile_context(formatted);
                     context.transition_to(current_state.clone())?;
@@ -528,6 +552,7 @@ mod tests {
             title: "actix-web".into(),
             url: "https://docs.rs/actix-web".into(),
             snippet: "actix-web 4.4.0".into(),
+            is_fallback: false,
         }]]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
@@ -650,13 +675,12 @@ mod tests {
         let (tx, rx) = event_channel();
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
-        let _result = engine
-            .run(&mut ctx, &llm, &search, "Doomed task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
-            .await;
+        let run_future = engine
+            .run(&mut ctx, &llm, &search, "Doomed task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), run_future).await;
 
-        // It escalated, but since it returns an error `AppError::Parse` immediately after transitioning
-        // to Escalated, it never re-enters the loop to hit the AwaitingHumanInput transition.
-        assert_eq!(*ctx.state(), WorkflowState::Escalated);
+        // handle_escalation blocks on the channel, so the state should be AwaitingHumanInput
+        assert_eq!(*ctx.state(), WorkflowState::AwaitingHumanInput);
 
         let events = collect_events(rx).await;
         assert!(events.iter().any(|e| matches!(e, EngineEvent::WorkflowEscalated { .. })));
