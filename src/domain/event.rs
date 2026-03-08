@@ -11,6 +11,9 @@ pub enum EngineEvent {
     /// Workflow has started with the given task.
     WorkflowStarted { task: String },
 
+    /// Ping event to keep SSE connection alive.
+    Ping,
+
     /// State machine transitioned.
     StateChanged {
         from: WorkflowState,
@@ -34,7 +37,10 @@ pub enum EngineEvent {
     WorkflowCompleted,
 
     /// Workflow escalated (deadlock or parse failure).
-    WorkflowEscalated { reason: String },
+    WorkflowEscalated {
+        reason: String,
+        task_id: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -49,6 +55,13 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"workflow_started""#));
         assert!(json.contains(r#""task":"Build API""#));
+    }
+
+    #[test]
+    fn ping_event_serializes() {
+        let event = EngineEvent::Ping;
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"ping""#));
     }
 
     #[test]
@@ -88,8 +101,10 @@ mod tests {
     fn escalated_event_serializes() {
         let event = EngineEvent::WorkflowEscalated {
             reason: "max iterations".into(),
+            task_id: Some("1234-5678".into()),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"workflow_escalated""#));
+        assert!(json.contains(r#""task_id":"1234-5678""#));
     }
 }

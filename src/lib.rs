@@ -16,6 +16,12 @@ pub mod error {
         #[error("Search client error: {0}")]
         SearchClient(String),
 
+        #[error("Operation cancelled")]
+        Cancelled,
+
+        #[error("Invalid state transition loop: {0}")]
+        StateTransition(String),
+
         #[error("Parse error: {0}")]
         Parse(String),
 

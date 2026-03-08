@@ -6,6 +6,7 @@ pub enum AgentRole {
     Architect,
     Programmer,
     DevilsAdvocate,
+    Human,
 }
 
 impl AgentRole {
@@ -15,6 +16,7 @@ impl AgentRole {
             AgentRole::Architect => "Architect",
             AgentRole::Programmer => "Programmer",
             AgentRole::DevilsAdvocate => "DevilsAdvocate",
+            AgentRole::Human => "Human",
         }
     }
 }
@@ -36,6 +38,7 @@ mod tests {
             AgentRole::Architect,
             AgentRole::Programmer,
             AgentRole::DevilsAdvocate,
+            AgentRole::Human,
         ] {
             let json = serde_json::to_string(&role).unwrap();
             let deserialized: AgentRole = serde_json::from_str(&json).unwrap();
@@ -47,5 +50,6 @@ mod tests {
     fn agent_role_display() {
         assert_eq!(AgentRole::Orchestrator.to_string(), "Orchestrator");
         assert_eq!(AgentRole::DevilsAdvocate.to_string(), "DevilsAdvocate");
+        assert_eq!(AgentRole::Human.to_string(), "Human");
     }
 }

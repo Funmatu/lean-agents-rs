@@ -1,116 +1,118 @@
-# 【絶対厳守】ASUS GX10(UMA) 最適化 Qwen3.5-27B マルチエージェント・システム：Phase 2 (堅牢化・対話・検証) 開発仕様書
+# 【厳格指令】lean-agents-rs Phase 2 実装指示書
 
-## 1. プロジェクトのフェーズ目的とAIコーダーへのミッション
+## 📌 ミッション概要
 
-あなたは世界最高峰のRustアーキテクト兼AIシステムエンジニアです。
-本仕様書は、ASUS Ascent GX10 (UMAアーキテクチャ) 環境に特化した独自状態遷移型マルチエージェントシステム（`lean-agents-rs`）を、**「PoC（概念実証）レベルから、実運用（Production）に耐えうる堅牢なシステム」**へと引き上げるための「Phase 2 拡張実装計画」です。
+あなたは世界最高峰のRustアーキテクトです。ASUS GX10 (UMAアーキテクチャ) 環境向けに最適化された `lean-agents-rs` プロジェクトのPhase 2（堅牢化・対話・フォールバック機構）を実装します。
+現在のアーキテクチャの最大の強みである「不要なメモリ確保の排除」「RadixAttentionキャッシュの保護」「RAIIによる確実なリソース解放」を絶対原則とし、1バイトたりとも無駄なアロケーションを増やさないこと。
 
-あなたのミッションは、これまでに構築された「非同期コンテキストグラフ」のコアロジックを破壊することなく、以下の課題を極めてエレガントかつオーバーヘッドゼロで解決することです。
+## ⚠️ 実装の基本ルール (絶対遵守)
 
-### 🚨 絶対遵守事項 (Hardware & Architecture Constraints)
-
-1. **UMA帯域の保護の徹底:** キャンセル処理やPing送信処理を追加する際、無駄なミューテックスロックや過剰なアロケーションを追加してはなりません。128GB LPDDR5x (273 GB/s) は常にSGLangの推論に明け渡す必要があります。
-2. **所有権とライフサイクルの明確化:** SSEコネクションの切断とGPU推論のキャンセルは、Rustのライフサイクル（Dropトレイト）および `tokio` のキャンセレーショントークンを用いて確実かつ即座に連動させなければなりません。
-3. **SDD & TDDの継続:** 仕様実装の前に、必ずドメインモデル（型・状態・イベント）の定義を行い、単体テストを記述すること。
+1. **SDD & TDDの徹底:** 必ず「ドメイン（型）の定義」→「テストコードの作成」→「実装」の順で進めること。
+2. **ステップバイステップ:** 以下の `Step 1` から順番に着手すること。**1つのStepが完了し、テストがパスし、ユーザー(私)が「次へ」と指示するまで、絶対に次のStepのコードを出力しないこと。**
+3. **エラーハンドリング:** `unwrap()` はテストコード以外で絶対に使用しない。必ず `AppError` にマッピングすること。
 
 ---
 
-## 2. 開発・実装ステップ詳細 (Implementation Plan)
+## 🚀 実装ステップ
 
-本タスクは以下の5つのStepで構成されます。AIコーダーは**必ずStepごとに実装とテストを完了させ、私の承認を得てから次のStepへ進むこと**。一気に全Stepのコードを出力することは禁止します。
+### 【Step 1】 ネットワーク堅牢化（キャンセレーションとタイムアウト防止）
 
-### 【Step 1】 ネットワーク堅牢化：キャンセレーションとタイムアウト防止
+**課題:** クライアントがブラウザを閉じてSSEが切断されても、裏で推論が完遂するまでGPUとセマフォ枠を占有してしまう。また、Nginx環境下で長時間無音だとタイムアウトする。
 
-現状のシステムにおける最大の脆弱性（インフラレイヤーのタイムアウトと、切断後のリソース浪費）を根本から解決します。
+#### 1-1. Domain層の更新 (Ping & Cancel Event)
 
-* **1-1: Keep-Alive Ping イベントの実装**
-* `src/domain/event.rs` の `EngineEvent` に `Ping` バリアントを追加せよ。
-* リバースプロキシ（Nginx/ALB等）のアイドルタイムアウト（通常30秒〜60秒）を防ぐため、`src/server/router.rs` 側のSSEストリーム生成部、または `src/engine/mod.rs` のループ内で、無音が **15秒** 続いた場合に空のPingイベント（例: `{"type": "ping"}`）をクライアントに送信する非同期タイマー（`tokio::time::interval` などを活用）を実装せよ。
+* `src/domain/event.rs` の `EngineEvent` に `Ping` を追加せよ。
+* `src/error.rs` (または `lib.rs` 内) の `AppError` に `Cancelled` バリアントを追加せよ。
+
+#### 1-2. CancellationTokenの導入
+
+* `Cargo.toml` に `tokio-util = "0.7"` を追加せよ。
+* `src/engine/mod.rs` の `Engine::run` および `execute_with_tool_support` メソッドの引数に `cancel_token: tokio_util::sync::CancellationToken` を追加せよ。
+* `execute_with_tool_support` 内の `agent.execute(context, llm).await` を以下のように `tokio::select!` でラップし、キャンセル検知時は即座に `AppError::Cancelled` を返すようにリファクタリングせよ。
+```rust
+tokio::select! {
+    res = agent.execute(context, llm) => res?,
+    _ = cancel_token.cancelled() => return Err(AppError::Cancelled),
+}
+
+```
 
 
-* **1-2: `tokio::select!` を用いた推論の即時・強制中断処理**
-* クライアントがブラウザを閉じた（SSEコネクションが切断された）際、誰も見ていないタスクのためにGPUリソースを消費し続けるのを防ぐため、`axum` のコネクション切断検知機能を活用せよ。
-* 提案アプローチ: `tokio_util::sync::CancellationToken` を用いる。APIハンドラでトークンを生成し、エンジン実行タスク（`tokio::spawn` 内）に渡す。
-* `src/client/llm.rs` のSGLang呼び出し（`reqwest`）や、エンジンの非同期ループ内において、`tokio::select!` を用いて「LLMの推論完了」と「キャンセルトークンの発火」を競わせる設計にリファクタリングせよ。キャンセル検知時は即座に処理を中断し、セマフォを安全に解放（Drop）すること。
+
+#### 1-3. Router層での切断検知とPing送信
+
+* `src/server/router.rs` の `stream_handler` にて以下を実装せよ。
+1. `CancellationToken::new()` を生成し、`Engine::run` に渡す。
+2. クライアント切断検知タスクをスポーンする: `tokio::spawn(async move { tx.closed().await; token.cancel(); });` (これによりSSE切断時に即座にトークンが発火する)。
+3. `ReceiverStream` 変換部分で、`tokio::time::interval` を用いて、15秒間イベントがない場合に `EngineEvent::Ping` をSSEに流す非同期ストリーム拡張（`StreamExt::timeout` など）を実装せよ。
 
 
 
-### 【Step 2】 Human-in-the-Loop (HITL) インタラクティブ介入機構
+**■ Step 1 の完了条件:** `cargo test` が通過すること。モックを用いたキャンセレーションの単体テストを `engine::tests` に追加すること。
 
-エージェントが無限ループに陥りエスカレーションした際、タスクを無に帰すのではなく、人間が介入してリカバリできる状態遷移を組み込みます。
+---
 
-* **2-1: 状態の拡張**
+### 【Step 2】 Human-in-the-Loop (HITL) 機構の実装
+
+**課題:** エスカレーション時にタスクが破棄されるのを防ぎ、人間が介入してリカバリできるようにする。
+
+#### 2-1. Domain層の更新 (状態とロール)
+
+* `src/domain/agent.rs` の `AgentRole` に `Human` を追加せよ。
 * `src/domain/state.rs` の `WorkflowState` に `AwaitingHumanInput` を追加せよ。
-* `Escalated` 状態から `AwaitingHumanInput` へ移行し、さらに人間の入力を受けて任意のフェーズ（例: `Reviewing` や `Designing`）へ復帰できる遷移ルール（`can_transition_to`）を定義し、テストを書け。
+* 遷移ルール: `Escalated -> AwaitingHumanInput`, `AwaitingHumanInput -> Planning`, `AwaitingHumanInput -> Designing` などを許可するように `can_transition_to` を更新し、テストせよ。
 
+#### 2-2. 状態保持と介入エンドポイント (Router & State)
 
-* **2-2: メッセージ履歴への人間からの注入**
-* `AgentRole` Enum に `Human` を追加するか、同等の表現を可能にせよ。
+* `src/server/state.rs` の `AppState` に、中断されたタスクを保持する `active_interventions: Arc<DashMap<String, mpsc::Sender<String>>>` を追加せよ（`dashmap` クレートを使用）。
+* `src/engine/mod.rs` において、`Escalated` に到達した際、即座に終了するのではなく、ユニークな `task_id` を発行し、受信用のチャネル (`mpsc::channel`) を `active_interventions` に登録せよ。その後 `AwaitingHumanInput` に遷移してチャネルの受信を待機 (`recv().await`) せよ。
+* 受信した人間のメッセージを `ContextGraph` に追加し、指定されたフェーズ（例：`Designing`）へ復帰させるロジックを実装せよ。
+* `src/server/router.rs` に `POST /v1/agent/intervene` (ペイロード: `{ task_id, message, resume_state }`) エンドポイントを追加し、該当タスクのチャネルにメッセージを送信する処理を実装せよ。
 
-
-* **2-3: 介入用 API エンドポイントの作成**
-* `POST /v1/agent/intervene` エンドポイントを `src/server/router.rs` に追加せよ。
-* 既存のストリームとどう紐付けるかが課題となるため、タスクID（UUID等）の発行と、メモリ上（または一時的）な状態保持機構（例: `DashMap<Uuid, mpsc::Sender>`）のアーキテクチャ設計を提案せよ。
-
-
-
-### 【Step 3】 検索APIフォールバック機構と情報劣化の制御（LLM混乱リスクの排除）
-
-Tavily APIの無料枠超過時に備え、動的で安全なフォールバック機構を構築します（優先度：低ですが、アーキテクチャの準備を行います）。
-
-* **3-1: FallbackSearchClient の実装**
-* `src/client/search.rs` に、複数の `Box<dyn SearchClient>` を優先順位順に保持する `FallbackSearchClient` を実装せよ。
-* いずれかのAPIが `HTTP 429` または上限到達エラーを返した際、シームレスに次のクライアントへリクエストを切り替えるロジックを実装し、モックを用いたテストを書け。
-
-
-* **3-2: 動的システムプロンプト（コンテキスト劣化警告）の注入**
-* Tavilyと異なり、Google等（代替API）は数行のスニペットしか返しません。情報劣化によるLLMの「検索無限ループ」を防ぐため、`SearchResult` のメタデータに `source_quality` (High / Low 等) を持たせよ。
-* `Low` クオリティの情報を受け取った場合、`ContextGraph` に `volatile_context` をセットする際、直前に「*[System Warning] 以下の検索結果は要約版です。情報が不足している場合は、検索キーワードを具体的に変えて再検索するか、推論を進めてください*」という警告文字列を動的に挿入するロジックを実装せよ。
-
-
-
-### 【Step 4】 ターミナル用 API クライアント (CLI) ツールの開発
-
-開発体験を向上させるため、SSEストリームを美しく可視化するCLIツールを別ディレクトリに作成します。
-
-* **4-1: 言語とライブラリの選定**
-* `tools/cli_client/` ディレクトリを作成し、Python（`httpx-sse`, `rich` 等）またはRust（`reqwest`, `crossterm`）を用いて実装せよ（AIコーダーが最も得意で堅牢な方を選択して提案すること）。
-
-
-* **4-2: 要件**
-* `workflow_started`, `agent_thinking`, `tool_call_executed`, `agent_spoke` のJSONイベントをパースすること。
-* Orchestrator (青)、Architect (マゼンタ)、Programmer (緑)、DevilsAdvocate (赤)、System/Tool (黄) など、役割ごとに明確に色分けして標準出力にストリーミング描画すること。
-
-
-
-### 【Step 5】 UMA帯域・実機パフォーマンステスト計画の策定
-
-実機（ASUS GX10）へのデプロイを見据えたプロファイリング計画をドキュメント化し、スクリプトを作成します。
-
-* **5-1: 負荷テストスクリプトの作成**
-* 同時に複数のSSEコネクションを張り、意図的に重いタスク（例: 「Linuxカーネルのスケジューラについて詳細な設計書を書け」）を投げ続ける負荷テストスクリプトを作成せよ。
-
-
-* **5-2: 監視メトリクスの定義**
-* セマフォの `MAX_CONCURRENT_TASKS` を 2, 4, 8 と変動させた際の、以下のメトリクスを取得・記録するためのbashスクリプトを作成せよ。
-* `nvidia-smi dmon` によるGPUメモリ帯域の使用率
-* `htop` (または `vmstat`) によるCPU負荷
-* クライアント側で計測したTPS (Tokens Per Second) の平均値
-
-
-
-
+**■ Step 2 の完了条件:** `dashmap` を用いた状態保持と、`Escalated` から復帰する流れの単体テストが通ること。
 
 ---
 
-## 3. AIコーダーへの初期アクション指示
+### 【Step 3】 検索APIフォールバック機構と情報劣化警告
 
-あなたは上記の仕様を完全に理解しました。
-**直ちにコードを書き始めることは禁じます。**
+**課題:** Tavily APIの無料枠が枯渇した際、自動的に代替APIに切り替え、かつLLMが情報劣化（短いスニペット）で混乱するのを防ぐ。
 
-まずは以下の2点を回答してください。
+#### 3-1. Domain / Client 層の拡張
 
-1. 本Phase 2の仕様（特にStep 1のキャンセレーションとタイムアウト防止、およびStep 2のHITLにおける状態保持の難易度）に対するあなたの技術的な見解と、想定される落とし穴（リスク）を簡潔に列挙してください。
-2. その後、**【Step 1】 ネットワーク堅牢化** に着手するための、具体的なRustの構造体・トレイト変更箇所をリストアップした「設計方針案」を提示してください。
+* `src/client/search.rs` の `SearchResult` に `is_fallback: bool` (または `quality` enum) を追加せよ。
+* `FallbackSearchClient` 構造体を実装せよ。これは `clients: Vec<Box<dyn SearchClient>>` を保持し、`search` メソッド内で優先順位順にループを回し、エラー（レートリミットやHTTP 429）が出たら次のクライアントへフォールバックする機能を持つ。
 
-私の承認（Approve）を得た後、Step 1の実装（テストコード先行）に入っていただきます。
+#### 3-2. 動的プロンプト（警告）の注入
+
+* `src/engine/mod.rs` において、検索結果を `volatile_context` にセットする際、結果の `is_fallback` が `true` であった場合、結果文字列の先頭に以下のシステム警告を動的に結合せよ。
+*"[System Warning] This search result is a fallback short snippet. If details are insufficient, refine your search query or proceed with current knowledge."*
+
+**■ Step 3 の完了条件:** `MockSearchClient` を用いて、1つ目が失敗し2つ目が成功するフォールバックのテストを作成し、パスさせること。
+
+---
+
+### 【Step 4】 実機パフォーマンステスト・スクリプトの作成
+
+**課題:** UMA帯域の限界を実機 (ASUS GX10) でプロファイリングするためのツール整備。
+
+#### 4-1. Bashプロファイリングスクリプト
+
+* リポジトリルートに `scripts/profile_uma.sh` を作成せよ。
+* 以下の処理を自動化するスクリプトを記述せよ。
+1. `nvidia-smi dmon -s m -d 1 > uma_bandwidth.log &` をバックグラウンド起動。
+2. Pythonスクリプト (`test_runner.py` の同時実行テスト関数など) を起動。
+3. Pythonスクリプト終了後、`nvidia-smi dmon` をkill。
+4. ログから `rxpci` と `txpci` (または該当するメモリスループット値) の最大値と平均値を `awk` で抽出してターミナルに表示。
+
+
+
+**■ Step 4 の完了条件:** シェルスクリプトが正しく実行権限つきで作成され、文法エラーがないこと。
+
+---
+
+## 🎯 アクション指示
+
+AIコーダーよ、指示は理解しましたか？
+まずは **【Step 1】 ネットワーク堅牢化** の実装内容（特に `tx.closed().await` を用いたキャンセレーションの仕組み）について、Rustの型やライフサイクルで問題が起きないかあなたの設計見解を述べ、実装を開始するための許可を私に求めてください。一気にコードを吐き出すことは厳禁です。
+
+---

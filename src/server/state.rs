@@ -1,9 +1,9 @@
 use std::sync::Arc;
+use dashmap::DashMap;
+use tokio::sync::{mpsc, Semaphore};
 
-use tokio::sync::Semaphore;
-
-use crate::client::llm::LlmClient;
-use crate::client::search::SearchClient;
+use crate::client::{llm::LlmClient, search::SearchClient};
+use crate::domain::state::WorkflowState;
 
 /// Default maximum concurrent engine executions.
 /// Protects GX10 UMA bandwidth and SGLang KV cache from saturation.
@@ -16,18 +16,20 @@ pub struct AppState {
     pub llm: Arc<dyn LlmClient>,
     pub search: Arc<dyn SearchClient>,
     pub concurrency_limiter: Arc<Semaphore>,
+    pub active_interventions: Arc<DashMap<String, mpsc::Sender<(String, WorkflowState)>>>,
 }
 
 impl AppState {
     pub fn new(
         llm: Arc<dyn LlmClient>,
         search: Arc<dyn SearchClient>,
-        max_concurrent: usize,
+        max_concurrent_tasks: usize,
     ) -> Self {
         Self {
             llm,
             search,
-            concurrency_limiter: Arc::new(Semaphore::new(max_concurrent)),
+            concurrency_limiter: Arc::new(Semaphore::new(max_concurrent_tasks)),
+            active_interventions: Arc::new(DashMap::new()),
         }
     }
 }

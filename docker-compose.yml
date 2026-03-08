@@ -3,7 +3,7 @@ services:
     image: lmsysorg/sglang:latest
     command: >
       python3 -m sglang.launch_server
-      --model-path Qwen/Qwen3.5-2B
+      --model-path Qwen/Qwen3.5-27B
       --port 30000
       --host 0.0.0.0
       --trust-remote-code
@@ -32,8 +32,7 @@ services:
       - "8080:8080"
     environment:
       SGLANG_URL: http://sglang:30000
-      # SGLANG_MODEL: Qwen/Qwen3.5-27B
-      SGLANG_MODEL: Qwen/Qwen3.5-2B 
+      SGLANG_MODEL: Qwen/Qwen3.5-27B
       TAVILY_API_KEY: ${TAVILY_API_KEY}
       MAX_CONCURRENT_TASKS: 4
       PORT: 8080

@@ -13,6 +13,7 @@ pub enum WorkflowState {
     },
     Completed,
     Escalated,
+    AwaitingHumanInput,
 }
 
 #[derive(Debug, Error)]
@@ -53,8 +54,19 @@ impl WorkflowState {
                 true
             }
 
-            // Any state can escalate
+            // AwaitingHumanInput can resume from various states
+            (
+                WorkflowState::AwaitingHumanInput,
+                WorkflowState::Planning
+                | WorkflowState::Designing
+                | WorkflowState::Implementing
+                | WorkflowState::Reviewing
+                | WorkflowState::Completed,
+            ) => true,
+
+            // Any state can escalate or await human input
             (_, WorkflowState::Escalated) => true,
+            (WorkflowState::Escalated, WorkflowState::AwaitingHumanInput) => true,
 
             _ => false,
         }
@@ -81,6 +93,22 @@ mod tests {
         assert!(!WorkflowState::Init.can_transition_to(&WorkflowState::Implementing));
         assert!(!WorkflowState::Planning.can_transition_to(&WorkflowState::Completed));
         assert!(!WorkflowState::Completed.can_transition_to(&WorkflowState::Init));
+    }
+
+    #[test]
+    fn hitl_transitions() {
+        // Escalated to AwaitingHumanInput
+        assert!(WorkflowState::Escalated.can_transition_to(&WorkflowState::AwaitingHumanInput));
+
+        // AwaitingHumanInput to other states
+        assert!(WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Planning));
+        assert!(WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Designing));
+        assert!(WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Implementing));
+        assert!(WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Reviewing));
+        assert!(WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Completed));
+        
+        // Cannot go to arbitrary states
+        assert!(!WorkflowState::AwaitingHumanInput.can_transition_to(&WorkflowState::Init));
     }
 
     #[test]
@@ -130,6 +158,7 @@ mod tests {
                 return_to: Box::new(WorkflowState::Reviewing),
             },
             WorkflowState::Escalated,
+            WorkflowState::AwaitingHumanInput,
         ];
         for state in states {
             let json = serde_json::to_string(&state).unwrap();

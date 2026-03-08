@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 
 use crate::domain::context::ContextGraph;
 use crate::domain::event::EngineEvent;
+use crate::domain::state::WorkflowState;
 use crate::engine::Engine;
 
 use super::state::AppState;
@@ -27,10 +28,19 @@ pub struct StreamRequest {
     pub task: String,
 }
 
+/// Request body for human intervention.
+#[derive(Debug, Deserialize)]
+pub struct InterveneRequest {
+    pub task_id: String,
+    pub message: String,
+    pub resume_state: WorkflowState,
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/agent/stream", post(stream_handler))
+        .route("/v1/agent/intervene", post(intervene_handler))
         .with_state(state)
 }
 
@@ -67,16 +77,34 @@ async fn stream_handler(
     let search = state.search.clone();
     let task = payload.task;
 
-    // Spawn engine execution in background.
-    // The permit is moved in — it will be dropped (released) when this task ends,
-    // whether by normal completion, error, or panic.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Spawn a lightweight task to monitor for SSE client disconnection
+    let tx_clone = tx.clone();
+    let token_clone = cancel_token.clone();
+    tokio::spawn(async move {
+        // Wait until the channel receiver is dropped
+        tx_clone.closed().await;
+        // Signal the engine to stop
+        token_clone.cancel();
+    });
+
+    let run_token = cancel_token.clone();
     tokio::spawn(async move {
         let _permit = permit; // Hold permit for task lifetime (RAII release)
         let engine = Engine::new();
         let mut context = ContextGraph::new();
 
         let result = engine
-            .run(&mut context, llm.as_ref(), search.as_ref(), &task, &tx)
+            .run(
+                &mut context,
+                llm.as_ref(),
+                search.as_ref(),
+                &task,
+                &tx,
+                run_token,
+                state.active_interventions.clone(),
+            )
             .await;
 
         if let Err(e) = result {
@@ -84,6 +112,7 @@ async fn stream_handler(
             let _ = tx
                 .send(EngineEvent::WorkflowEscalated {
                     reason: e.to_string(),
+                    task_id: None,
                 })
                 .await;
         }
@@ -97,6 +126,33 @@ async fn stream_handler(
     });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// POST /v1/agent/intervene
+///
+/// Send a human message to a suspended (Escalated/AwaitingHumanInput) workflow
+/// and command it to resume from a specific state.
+async fn intervene_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<InterveneRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Look up the task_id in the active interventions map
+    if let Some(entry) = state.active_interventions.remove(&payload.task_id) {
+        let tx = entry.1;
+        // Send the human message and the desired resume state
+        if tx.send((payload.message, payload.resume_state)).await.is_err() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send intervention (workflow may have dropped receiver)".into(),
+            ));
+        }
+        Ok(StatusCode::OK)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("No active intervention found for task_id: {}", payload.task_id),
+        ))
+    }
 }
 
 #[cfg(test)]
