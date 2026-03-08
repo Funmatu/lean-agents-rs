@@ -8,6 +8,7 @@
 # ///
 import asyncio
 import json
+import sys
 import httpx
 from httpx_sse import aconnect_sse
 from rich.console import Console
@@ -155,4 +156,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--run-concurrent" in sys.argv:
+        asyncio.run(test_concurrent_execution())
+    else:
+        asyncio.run(main())
