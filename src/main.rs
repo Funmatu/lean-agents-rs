@@ -1,11 +1,12 @@
 use std::env;
-use std::process;
+use std::sync::Arc;
 
 use lean_agents_rs::client::llm::SgLangClient;
 use lean_agents_rs::client::search::TavilyClient;
-use lean_agents_rs::domain::context::ContextGraph;
-use lean_agents_rs::domain::state::WorkflowState;
-use lean_agents_rs::engine::Engine;
+use lean_agents_rs::server::router::build_router;
+use lean_agents_rs::server::state::{AppState, DEFAULT_MAX_CONCURRENT_TASKS};
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() {
@@ -17,69 +18,47 @@ async fn main() {
         .init();
 
     let sglang_url = env::var("SGLANG_URL").unwrap_or_else(|_| {
-        eprintln!("Warning: SGLANG_URL not set, using default http://localhost:30000");
+        tracing::warn!("SGLANG_URL not set, using default http://localhost:30000");
         "http://localhost:30000".to_string()
     });
 
     let model = env::var("SGLANG_MODEL").unwrap_or_else(|_| "Qwen3.5-27B".to_string());
 
     let tavily_key = env::var("TAVILY_API_KEY").unwrap_or_else(|_| {
-        eprintln!("Warning: TAVILY_API_KEY not set, search functionality will fail");
+        tracing::warn!("TAVILY_API_KEY not set, search functionality will fail");
         String::new()
     });
 
-    let task = env::args()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let max_concurrent: usize = env::var("MAX_CONCURRENT_TASKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS);
 
-    if task.is_empty() {
-        eprintln!("Usage: lean-agents-rs <task description>");
-        eprintln!();
-        eprintln!("Environment variables:");
-        eprintln!("  SGLANG_URL       SGLang API endpoint (default: http://localhost:30000)");
-        eprintln!("  SGLANG_MODEL     Model name (default: Qwen3.5-27B)");
-        eprintln!("  TAVILY_API_KEY   Tavily search API key");
-        eprintln!("  RUST_LOG         Log level (default: info)");
-        process::exit(1);
-    }
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
 
-    let llm = SgLangClient::new(&sglang_url, &model);
-    let search = TavilyClient::new(&tavily_key);
-    let engine = Engine::new();
-    let mut context = ContextGraph::new();
+    let llm = Arc::new(SgLangClient::new(&sglang_url, &model));
+    let search = Arc::new(TavilyClient::new(&tavily_key));
+    let state = AppState::new(llm, search, max_concurrent);
 
-    tracing::info!("Starting lean-agents-rs with task: {}", task);
-    tracing::info!("SGLang endpoint: {}", sglang_url);
-    tracing::info!("Model: {}", model);
+    let app = build_router(state)
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http());
 
-    match engine.run(&mut context, &llm, &search, &task).await {
-        Ok(()) => match context.state() {
-            WorkflowState::Completed => {
-                tracing::info!("Workflow completed successfully");
-                println!("\n=== Workflow Complete ===");
-                for msg in context.messages() {
-                    println!("[{}] {}", msg.sender, msg.content);
-                }
-            }
-            WorkflowState::Escalated => {
-                tracing::warn!("Workflow escalated (deadlock prevention triggered)");
-                println!("\n=== Workflow Escalated ===");
-                println!("The agents could not reach consensus within the iteration limit.");
-                for msg in context.messages() {
-                    println!("[{}] {}", msg.sender, msg.content);
-                }
-                process::exit(2);
-            }
-            state => {
-                tracing::error!("Unexpected final state: {:?}", state);
-                process::exit(3);
-            }
-        },
-        Err(e) => {
-            tracing::error!("Engine error: {}", e);
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    }
+    let bind_addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .expect("Failed to bind TCP listener");
+
+    tracing::info!("lean-agents-rs API server starting");
+    tracing::info!("  Endpoint: http://{bind_addr}");
+    tracing::info!("  SGLang:   {sglang_url}");
+    tracing::info!("  Model:    {model}");
+    tracing::info!("  Max concurrent tasks: {max_concurrent}");
+
+    axum::serve(listener, app)
+        .await
+        .expect("Server error");
 }

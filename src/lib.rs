@@ -3,6 +3,7 @@ pub mod client;
 pub mod parser;
 pub mod agents;
 pub mod engine;
+pub mod server;
 
 pub mod error {
     use thiserror::Error;

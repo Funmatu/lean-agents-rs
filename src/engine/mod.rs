@@ -1,3 +1,4 @@
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::agents::architect::ArchitectAgent;
@@ -9,6 +10,7 @@ use crate::client::llm::LlmClient;
 use crate::client::search::SearchClient;
 use crate::domain::agent::AgentRole;
 use crate::domain::context::ContextGraph;
+use crate::domain::event::EngineEvent;
 use crate::domain::message::Message;
 use crate::domain::state::WorkflowState;
 use crate::error::AppError;
@@ -35,30 +37,61 @@ impl Engine {
         }
     }
 
-    /// Run the full workflow engine loop.
+    /// Emit an event. If the receiver is dropped (e.g. SSE client disconnected),
+    /// log a warning but do NOT abort the engine — the workflow continues.
+    async fn emit(tx: &mpsc::Sender<EngineEvent>, event: EngineEvent) {
+        if tx.send(event).await.is_err() {
+            warn!("Event receiver dropped, continuing without event delivery");
+        }
+    }
+
+    /// Run the full workflow engine loop, emitting EngineEvents via `tx`.
     pub async fn run(
         &self,
         context: &mut ContextGraph,
         llm: &dyn LlmClient,
         search: &dyn SearchClient,
         task: &str,
+        tx: &mpsc::Sender<EngineEvent>,
     ) -> Result<(), AppError> {
+        Self::emit(tx, EngineEvent::WorkflowStarted {
+            task: task.to_string(),
+        }).await;
+
         // Init -> Planning
+        let from = context.state().clone();
         context.transition_to(WorkflowState::Planning)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::Planning,
+        }).await;
         context.add_message(Message::new(AgentRole::Orchestrator, task));
         info!("Engine started: Init -> Planning");
 
         // Planning phase: Orchestrator creates a plan
+        Self::emit(tx, EngineEvent::AgentThinking {
+            role: AgentRole::Orchestrator,
+        }).await;
         let plan = self.execute_with_tool_support(
             &self.orchestrator,
             context,
             llm,
             search,
+            tx,
         ).await?;
+        Self::emit(tx, EngineEvent::AgentSpoke {
+            role: AgentRole::Orchestrator,
+            content: plan.clone(),
+        }).await;
         context.add_message(Message::new(AgentRole::Orchestrator, &plan));
 
         // Planning -> Designing
+        let from = context.state().clone();
         context.transition_to(WorkflowState::Designing)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::Designing,
+        }).await;
         info!("Planning -> Designing");
 
         // Design loop: Architect proposes, DevilsAdvocate reviews
@@ -67,25 +100,44 @@ impl Engine {
             if design_iterations >= MAX_ITERATIONS {
                 warn!("Design phase exceeded MAX_ITERATIONS, escalating");
                 context.transition_to(WorkflowState::Escalated)?;
+                Self::emit(tx, EngineEvent::WorkflowEscalated {
+                    reason: "Design phase exceeded max iterations".into(),
+                }).await;
                 return Ok(());
             }
 
             // Architect designs
+            Self::emit(tx, EngineEvent::AgentThinking {
+                role: AgentRole::Architect,
+            }).await;
             let design = self.execute_with_tool_support(
                 &self.architect,
                 context,
                 llm,
                 search,
+                tx,
             ).await?;
+            Self::emit(tx, EngineEvent::AgentSpoke {
+                role: AgentRole::Architect,
+                content: design.clone(),
+            }).await;
             context.add_message(Message::new(AgentRole::Architect, &design));
 
             // DevilsAdvocate reviews design
+            Self::emit(tx, EngineEvent::AgentThinking {
+                role: AgentRole::DevilsAdvocate,
+            }).await;
             let review = self.execute_with_tool_support(
                 &self.devils_advocate,
                 context,
                 llm,
                 search,
+                tx,
             ).await?;
+            Self::emit(tx, EngineEvent::AgentSpoke {
+                role: AgentRole::DevilsAdvocate,
+                content: review.clone(),
+            }).await;
             context.add_message(Message::new(AgentRole::DevilsAdvocate, &review));
 
             if parser::is_approval(&review) {
@@ -98,20 +150,38 @@ impl Engine {
         }
 
         // Designing -> Implementing
+        let from = context.state().clone();
         context.transition_to(WorkflowState::Implementing)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::Implementing,
+        }).await;
         info!("Designing -> Implementing");
 
         // Programmer implements
+        Self::emit(tx, EngineEvent::AgentThinking {
+            role: AgentRole::Programmer,
+        }).await;
         let implementation = self.execute_with_tool_support(
             &self.programmer,
             context,
             llm,
             search,
+            tx,
         ).await?;
+        Self::emit(tx, EngineEvent::AgentSpoke {
+            role: AgentRole::Programmer,
+            content: implementation.clone(),
+        }).await;
         context.add_message(Message::new(AgentRole::Programmer, &implementation));
 
         // Implementing -> Reviewing
+        let from = context.state().clone();
         context.transition_to(WorkflowState::Reviewing)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::Reviewing,
+        }).await;
         info!("Implementing -> Reviewing");
 
         // Review loop: DevilsAdvocate reviews, may send back to Programmer
@@ -120,15 +190,26 @@ impl Engine {
             if review_iterations >= MAX_ITERATIONS {
                 warn!("Review phase exceeded MAX_ITERATIONS, escalating");
                 context.transition_to(WorkflowState::Escalated)?;
+                Self::emit(tx, EngineEvent::WorkflowEscalated {
+                    reason: "Review phase exceeded max iterations".into(),
+                }).await;
                 return Ok(());
             }
 
+            Self::emit(tx, EngineEvent::AgentThinking {
+                role: AgentRole::DevilsAdvocate,
+            }).await;
             let review = self.execute_with_tool_support(
                 &self.devils_advocate,
                 context,
                 llm,
                 search,
+                tx,
             ).await?;
+            Self::emit(tx, EngineEvent::AgentSpoke {
+                role: AgentRole::DevilsAdvocate,
+                content: review.clone(),
+            }).await;
             context.add_message(Message::new(AgentRole::DevilsAdvocate, &review));
 
             if parser::is_approval(&review) {
@@ -137,39 +218,61 @@ impl Engine {
             }
 
             // Rework: Reviewing -> Implementing -> Reviewing
+            let from = context.state().clone();
             context.transition_to(WorkflowState::Implementing)?;
+            Self::emit(tx, EngineEvent::StateChanged {
+                from,
+                to: WorkflowState::Implementing,
+            }).await;
+
+            Self::emit(tx, EngineEvent::AgentThinking {
+                role: AgentRole::Programmer,
+            }).await;
             let rework = self.execute_with_tool_support(
                 &self.programmer,
                 context,
                 llm,
                 search,
+                tx,
             ).await?;
+            Self::emit(tx, EngineEvent::AgentSpoke {
+                role: AgentRole::Programmer,
+                content: rework.clone(),
+            }).await;
             context.add_message(Message::new(AgentRole::Programmer, &rework));
+
+            let from = context.state().clone();
             context.transition_to(WorkflowState::Reviewing)?;
+            Self::emit(tx, EngineEvent::StateChanged {
+                from,
+                to: WorkflowState::Reviewing,
+            }).await;
 
             review_iterations += 1;
             info!("Review iteration {review_iterations}: rework requested");
         }
 
         // Reviewing -> Completed
+        let from = context.state().clone();
         context.transition_to(WorkflowState::Completed)?;
+        Self::emit(tx, EngineEvent::StateChanged {
+            from,
+            to: WorkflowState::Completed,
+        }).await;
+        Self::emit(tx, EngineEvent::WorkflowCompleted).await;
         info!("Workflow completed successfully");
 
         Ok(())
     }
 
     /// Execute an agent with tool call interception and self-correction.
-    ///
-    /// - If the agent outputs a tool call, its CoT speech is preserved in history,
-    ///   the search is performed, and the agent is re-invoked.
-    /// - If the LLM produces unparseable output, the error is fed back as a
-    ///   user message and the agent retries (up to MAX_PARSE_RETRIES).
     async fn execute_with_tool_support(
         &self,
         agent: &dyn Agent,
         context: &mut ContextGraph,
         llm: &dyn LlmClient,
         search: &dyn SearchClient,
+        tx: &mpsc::Sender<EngineEvent>,
     ) -> Result<String, AppError> {
         let current_state = context.state().clone();
         let mut tool_calls = 0u32;
@@ -180,7 +283,7 @@ impl Engine {
 
             let output = match parser::parse_agent_output(&raw) {
                 Ok(parsed) => {
-                    parse_retries = 0; // Reset on successful parse
+                    parse_retries = 0;
                     parsed
                 }
                 Err(e) => {
@@ -193,6 +296,13 @@ impl Engine {
                         );
                         context.clear_volatile_context();
                         context.transition_to(WorkflowState::Escalated)?;
+                        Self::emit(tx, EngineEvent::WorkflowEscalated {
+                            reason: format!(
+                                "Agent {:?} failed to produce valid output after {} retries",
+                                agent.role(),
+                                MAX_PARSE_RETRIES
+                            ),
+                        }).await;
                         return Err(AppError::Parse(format!(
                             "agent {:?} failed to produce valid output after {} retries: {}",
                             agent.role(),
@@ -207,11 +317,7 @@ impl Engine {
                         MAX_PARSE_RETRIES,
                         e
                     );
-                    // Feed error back to LLM as a correction message
-                    context.add_message(Message::new(
-                        agent.role(),
-                        &raw,
-                    ));
+                    context.add_message(Message::new(agent.role(), &raw));
                     context.add_message(Message::new(
                         AgentRole::Orchestrator,
                         &format!(
@@ -228,12 +334,10 @@ impl Engine {
 
             match tool_call {
                 None => {
-                    // Pure speech — return the final answer
                     context.clear_volatile_context();
                     return Ok(speech);
                 }
                 Some(tc) => {
-                    // Preserve CoT speech in history before executing tool call
                     if !speech.is_empty() {
                         context.add_message(Message::new(agent.role(), &speech));
                     }
@@ -257,12 +361,17 @@ impl Engine {
                         tc.query
                     );
 
+                    Self::emit(tx, EngineEvent::ToolCallExecuted {
+                        role: agent.role(),
+                        action: tc.action.clone(),
+                        query: tc.query.clone(),
+                    }).await;
+
                     // Transition to ToolCalling
                     context.transition_to(WorkflowState::ToolCalling {
                         return_to: Box::new(current_state.clone()),
                     })?;
 
-                    // Perform search and format as structured JSON to prevent prompt injection
                     let results = search.search(&tc.query).await?;
                     debug!(
                         agent = ?agent.role(),
@@ -283,10 +392,7 @@ impl Engine {
                     )
                     .unwrap_or_else(|_| "[]".to_string());
 
-                    // Store in volatile context
                     context.set_volatile_context(formatted);
-
-                    // Return to original state
                     context.transition_to(current_state.clone())?;
                 }
             }
@@ -307,14 +413,22 @@ mod tests {
     use crate::client::search::tests::MockSearchClient;
     use crate::client::search::SearchResult;
 
+    /// Helper: create a channel and return (tx, rx) for engine tests.
+    fn event_channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
+        mpsc::channel(128)
+    }
+
+    /// Drain all events from the receiver into a Vec.
+    async fn collect_events(mut rx: mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     #[tokio::test]
     async fn happy_path_approve_all() {
-        // Mock LLM responses for the full workflow:
-        // 1. Orchestrator plan
-        // 2. Architect design
-        // 3. DevilsAdvocate approves design
-        // 4. Programmer implementation
-        // 5. DevilsAdvocate approves implementation
         let llm = MockLlmClient::new(vec![
             "Here is the plan: build a REST API".into(),
             "Design: Use actix-web with PostgreSQL".into(),
@@ -325,24 +439,33 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Build a REST API")
+            .run(&mut ctx, &llm, &search, "Build a REST API", &tx)
             .await
             .unwrap();
 
         assert_eq!(*ctx.state(), WorkflowState::Completed);
         assert!(ctx.volatile_context().is_none());
+
+        // Verify events
+        let events = collect_events(rx).await;
+        assert!(events.iter().any(|e| matches!(e, EngineEvent::WorkflowStarted { .. })));
+        assert!(events.iter().any(|e| matches!(e, EngineEvent::WorkflowCompleted)));
+        // Should have AgentThinking for each agent invocation (5 total)
+        let thinking_count = events.iter().filter(|e| matches!(e, EngineEvent::AgentThinking { .. })).count();
+        assert_eq!(thinking_count, 5);
+        // Should have AgentSpoke for each agent response (5 total)
+        let spoke_count = events.iter().filter(|e| matches!(e, EngineEvent::AgentSpoke { .. })).count();
+        assert_eq!(spoke_count, 5);
     }
 
     #[tokio::test]
     async fn search_with_cot_preserved() {
-        // Architect outputs reasoning + tool call; reasoning is preserved in history
         let llm = MockLlmClient::new(vec![
             "Plan: research and build".into(),
-            // Architect's response: CoT + tool call JSON
             r#"I need to check the latest version. {"action": "search", "query": "actix-web latest version"}"#.into(),
-            // After getting search results, Architect gives design
             "Design: Use actix-web 4.x based on search results".into(),
             "Approve - design is well-researched".into(),
             "impl complete".into(),
@@ -355,25 +478,32 @@ mod tests {
         }]]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Build with actix")
+            .run(&mut ctx, &llm, &search, "Build with actix", &tx)
             .await
             .unwrap();
 
         assert_eq!(*ctx.state(), WorkflowState::Completed);
         assert_eq!(search.call_count(), 1);
-        // Verify CoT speech was preserved in message history
         let messages = ctx.messages();
         assert!(
             messages.iter().any(|m| m.content.contains("I need to check the latest version")),
             "CoT reasoning should be preserved in history"
         );
+
+        // Verify ToolCallExecuted event was emitted
+        let events = collect_events(rx).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EngineEvent::ToolCallExecuted { action, query, .. }
+            if action == "search" && query == "actix-web latest version"
+        )));
     }
 
     #[tokio::test]
     async fn escalation_on_design_rejection_loop() {
-        // DevilsAdvocate always rejects -> should escalate after MAX_ITERATIONS
         let mut responses = vec!["Plan: do stuff".to_string()];
         for _ in 0..MAX_ITERATIONS {
             responses.push("Design attempt".into());
@@ -383,18 +513,21 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Impossible task")
+            .run(&mut ctx, &llm, &search, "Impossible task", &tx)
             .await
             .unwrap();
 
         assert_eq!(*ctx.state(), WorkflowState::Escalated);
+
+        let events = collect_events(rx).await;
+        assert!(events.iter().any(|e| matches!(e, EngineEvent::WorkflowEscalated { .. })));
     }
 
     #[tokio::test]
     async fn escalation_on_review_rejection_loop() {
-        // Design approved, but review always rejects
         let mut responses = vec![
             "Plan: build it".to_string(),
             "Design: simple approach".into(),
@@ -409,9 +542,10 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, _rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Contentious task")
+            .run(&mut ctx, &llm, &search, "Contentious task", &tx)
             .await
             .unwrap();
 
@@ -420,13 +554,9 @@ mod tests {
 
     #[tokio::test]
     async fn self_correction_on_parse_error() {
-        // Orchestrator produces valid plan.
-        // Architect produces garbage on first try, then corrects itself.
         let llm = MockLlmClient::new(vec![
             "Plan: build it".into(),
-            // Architect's first attempt: empty output (will fail parse)
             "   ".into(),
-            // After receiving error feedback, Architect corrects:
             "Design: corrected approach".into(),
             "Approve - looks good".into(),
             "Code complete".into(),
@@ -435,14 +565,14 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, _rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Test self-correction")
+            .run(&mut ctx, &llm, &search, "Test self-correction", &tx)
             .await
             .unwrap();
 
         assert_eq!(*ctx.state(), WorkflowState::Completed);
-        // Verify error feedback was added to history
         let messages = ctx.messages();
         assert!(
             messages.iter().any(|m| m.content.contains("[System Error]")),
@@ -452,10 +582,8 @@ mod tests {
 
     #[tokio::test]
     async fn self_correction_escalates_after_max_retries() {
-        // Agent always produces empty/unparseable output
         let llm = MockLlmClient::new(vec![
             "Plan: build it".into(),
-            // Architect fails 4 times (1 original + 3 retries = exceeds MAX_PARSE_RETRIES)
             "   ".into(),
             "   ".into(),
             "   ".into(),
@@ -464,13 +592,17 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, rx) = event_channel();
 
         let result = engine
-            .run(&mut ctx, &llm, &search, "Doomed task")
+            .run(&mut ctx, &llm, &search, "Doomed task", &tx)
             .await;
 
         assert!(result.is_err());
         assert_eq!(*ctx.state(), WorkflowState::Escalated);
+
+        let events = collect_events(rx).await;
+        assert!(events.iter().any(|e| matches!(e, EngineEvent::WorkflowEscalated { .. })));
     }
 
     #[tokio::test]
@@ -485,13 +617,52 @@ mod tests {
         let search = MockSearchClient::new(vec![]);
         let mut ctx = ContextGraph::new();
         let engine = Engine::new();
+        let (tx, _rx) = event_channel();
 
         engine
-            .run(&mut ctx, &llm, &search, "Test volatile cleanup")
+            .run(&mut ctx, &llm, &search, "Test volatile cleanup", &tx)
             .await
             .unwrap();
 
-        // volatile_context should always be None after completion
         assert!(ctx.volatile_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn events_emitted_for_state_transitions() {
+        let llm = MockLlmClient::new(vec![
+            "Plan".into(),
+            "Design".into(),
+            "Approve".into(),
+            "Code".into(),
+            "Approve".into(),
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+        let (tx, rx) = event_channel();
+
+        engine
+            .run(&mut ctx, &llm, &search, "Event test", &tx)
+            .await
+            .unwrap();
+
+        let events = collect_events(rx).await;
+
+        // Verify full event sequence
+        let state_changes: Vec<_> = events.iter().filter_map(|e| {
+            if let EngineEvent::StateChanged { to, .. } = e {
+                Some(to.clone())
+            } else {
+                None
+            }
+        }).collect();
+
+        assert_eq!(state_changes, vec![
+            WorkflowState::Planning,
+            WorkflowState::Designing,
+            WorkflowState::Implementing,
+            WorkflowState::Reviewing,
+            WorkflowState::Completed,
+        ]);
     }
 }
