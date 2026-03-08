@@ -12,10 +12,11 @@ use crate::domain::context::ContextGraph;
 use crate::domain::message::Message;
 use crate::domain::state::WorkflowState;
 use crate::error::AppError;
-use crate::parser::{self, AgentOutput};
+use crate::parser::{self, ParsedOutput};
 
 const MAX_ITERATIONS: u32 = 3;
 const MAX_TOOL_CALLS_PER_TURN: u32 = 3;
+const MAX_PARSE_RETRIES: u32 = 3;
 
 pub struct Engine {
     orchestrator: OrchestratorAgent,
@@ -157,9 +158,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Execute an agent with tool call interception.
-    /// If the agent outputs a tool call, perform the search, store result
-    /// in volatile_context, and re-invoke the agent.
+    /// Execute an agent with tool call interception and self-correction.
+    ///
+    /// - If the agent outputs a tool call, its CoT speech is preserved in history,
+    ///   the search is performed, and the agent is re-invoked.
+    /// - If the LLM produces unparseable output, the error is fed back as a
+    ///   user message and the agent retries (up to MAX_PARSE_RETRIES).
     async fn execute_with_tool_support(
         &self,
         agent: &dyn Agent,
@@ -169,18 +173,71 @@ impl Engine {
     ) -> Result<String, AppError> {
         let current_state = context.state().clone();
         let mut tool_calls = 0u32;
+        let mut parse_retries = 0u32;
 
         loop {
             let raw = agent.execute(context, llm).await?;
-            let output = parser::parse_agent_output(&raw)?;
 
-            match output {
-                AgentOutput::Speech(text) => {
-                    // Clear volatile context after final answer
-                    context.clear_volatile_context();
-                    return Ok(text);
+            let output = match parser::parse_agent_output(&raw) {
+                Ok(parsed) => {
+                    parse_retries = 0; // Reset on successful parse
+                    parsed
                 }
-                AgentOutput::ToolCall(tc) => {
+                Err(e) => {
+                    parse_retries += 1;
+                    if parse_retries > MAX_PARSE_RETRIES {
+                        warn!(
+                            "Agent {:?} exceeded max parse retries ({}), escalating",
+                            agent.role(),
+                            MAX_PARSE_RETRIES
+                        );
+                        context.clear_volatile_context();
+                        context.transition_to(WorkflowState::Escalated)?;
+                        return Err(AppError::Parse(format!(
+                            "agent {:?} failed to produce valid output after {} retries: {}",
+                            agent.role(),
+                            MAX_PARSE_RETRIES,
+                            e
+                        )));
+                    }
+                    warn!(
+                        "Agent {:?} parse error (retry {}/{}): {}",
+                        agent.role(),
+                        parse_retries,
+                        MAX_PARSE_RETRIES,
+                        e
+                    );
+                    // Feed error back to LLM as a correction message
+                    context.add_message(Message::new(
+                        agent.role(),
+                        &raw,
+                    ));
+                    context.add_message(Message::new(
+                        AgentRole::Orchestrator,
+                        &format!(
+                            "[System Error] Your previous output could not be parsed: {}. \
+                             Please correct your response format.",
+                            e
+                        ),
+                    ));
+                    continue;
+                }
+            };
+
+            let ParsedOutput { speech, tool_call } = output;
+
+            match tool_call {
+                None => {
+                    // Pure speech — return the final answer
+                    context.clear_volatile_context();
+                    return Ok(speech);
+                }
+                Some(tc) => {
+                    // Preserve CoT speech in history before executing tool call
+                    if !speech.is_empty() {
+                        context.add_message(Message::new(agent.role(), &speech));
+                    }
+
                     tool_calls += 1;
                     if tool_calls > MAX_TOOL_CALLS_PER_TURN {
                         warn!(
@@ -279,12 +336,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_then_approve_path() {
-        // Architect requests a search, then approves after getting results
+    async fn search_with_cot_preserved() {
+        // Architect outputs reasoning + tool call; reasoning is preserved in history
         let llm = MockLlmClient::new(vec![
             "Plan: research and build".into(),
-            // Architect's first response is a tool call
-            r#"{"action": "search", "query": "actix-web latest version"}"#.into(),
+            // Architect's response: CoT + tool call JSON
+            r#"I need to check the latest version. {"action": "search", "query": "actix-web latest version"}"#.into(),
             // After getting search results, Architect gives design
             "Design: Use actix-web 4.x based on search results".into(),
             "Approve - design is well-researched".into(),
@@ -306,6 +363,12 @@ mod tests {
 
         assert_eq!(*ctx.state(), WorkflowState::Completed);
         assert_eq!(search.call_count(), 1);
+        // Verify CoT speech was preserved in message history
+        let messages = ctx.messages();
+        assert!(
+            messages.iter().any(|m| m.content.contains("I need to check the latest version")),
+            "CoT reasoning should be preserved in history"
+        );
     }
 
     #[tokio::test]
@@ -352,6 +415,61 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(*ctx.state(), WorkflowState::Escalated);
+    }
+
+    #[tokio::test]
+    async fn self_correction_on_parse_error() {
+        // Orchestrator produces valid plan.
+        // Architect produces garbage on first try, then corrects itself.
+        let llm = MockLlmClient::new(vec![
+            "Plan: build it".into(),
+            // Architect's first attempt: empty output (will fail parse)
+            "   ".into(),
+            // After receiving error feedback, Architect corrects:
+            "Design: corrected approach".into(),
+            "Approve - looks good".into(),
+            "Code complete".into(),
+            "Approve - ship it".into(),
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+
+        engine
+            .run(&mut ctx, &llm, &search, "Test self-correction")
+            .await
+            .unwrap();
+
+        assert_eq!(*ctx.state(), WorkflowState::Completed);
+        // Verify error feedback was added to history
+        let messages = ctx.messages();
+        assert!(
+            messages.iter().any(|m| m.content.contains("[System Error]")),
+            "Parse error feedback should be in history"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_correction_escalates_after_max_retries() {
+        // Agent always produces empty/unparseable output
+        let llm = MockLlmClient::new(vec![
+            "Plan: build it".into(),
+            // Architect fails 4 times (1 original + 3 retries = exceeds MAX_PARSE_RETRIES)
+            "   ".into(),
+            "   ".into(),
+            "   ".into(),
+            "   ".into(),
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+
+        let result = engine
+            .run(&mut ctx, &llm, &search, "Doomed task")
+            .await;
+
+        assert!(result.is_err());
         assert_eq!(*ctx.state(), WorkflowState::Escalated);
     }
 

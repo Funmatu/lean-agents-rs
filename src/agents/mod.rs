@@ -19,42 +19,40 @@ pub trait Agent: Send + Sync {
 
     /// Build the full message array for the LLM, respecting RadixAttention:
     /// 1. System prompt (immutable prefix — cached by SGLang)
-    /// 2. Volatile context (temporary, inserted right after system)
-    /// 3. Message history
+    /// 2. Message history (grows monotonically — prefix-cacheable across turns)
+    /// 3. Volatile context (ephemeral, tail position — never invalidates prefix cache)
     fn build_messages(&self, context: &ContextGraph) -> Vec<ChatMessage> {
-        // Pre-allocate: 1 system + optional volatile + message history
         let history_len = context.messages().len();
         let volatile_present = context.volatile_context().is_some();
-        let capacity = 1 + volatile_present as usize + history_len;
+        let capacity = 1 + history_len + volatile_present as usize;
         let mut messages = Vec::with_capacity(capacity);
 
         // 1. System prompt (stable prefix for RadixAttention / Prefix Caching)
-        //    This MUST remain identical across calls to maximize cache hits.
         messages.push(ChatMessage {
             role: "system".into(),
             content: self.system_prompt().to_string(),
         });
 
-        // 2. Volatile context (ephemeral search results, dropped after use)
-        //    Placed directly after system to keep prefix stable up to this point.
-        if let Some(volatile) = context.volatile_context() {
-            messages.push(ChatMessage {
-                role: "system".into(),
-                content: format!(
-                    "[Temporary Reference — do not store]\n{}",
-                    volatile
-                ),
-            });
-        }
-
-        // 3. Message history — we reference content via &str and format only
-        //    the minimal wrapper. No .clone() of Message structs occurs here.
+        // 2. Message history — monotonically growing, maximizes prefix cache hits
         let my_role = self.role();
         for msg in context.messages() {
             let role = if msg.sender == my_role { "assistant" } else { "user" };
             messages.push(ChatMessage {
                 role: role.into(),
                 content: format!("[{}] {}", msg.sender, msg.content),
+            });
+        }
+
+        // 3. Volatile context (ephemeral search results, tail position)
+        //    Using "user" role to avoid breaking the system prompt prefix cache.
+        //    Dropped after one turn so it never accumulates in history.
+        if let Some(volatile) = context.volatile_context() {
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: format!(
+                    "[Temporary Reference — do not store]\n{}",
+                    volatile
+                ),
             });
         }
 
@@ -113,17 +111,41 @@ mod tests {
     }
 
     #[test]
-    fn build_messages_with_volatile_context() {
+    fn build_messages_with_volatile_context_at_end() {
         let agent = TestAgent;
         let mut ctx = ContextGraph::new();
         ctx.transition_to(WorkflowState::Planning).unwrap();
+        ctx.add_message(Message::new(AgentRole::Orchestrator, "Plan this"));
         ctx.set_volatile_context("Search result: Rust is great".to_string());
 
         let messages = agent.build_messages(&ctx);
+        // system + 1 history + volatile at end
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, "You are a test agent.");
+        // History comes second (prefix-cacheable)
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("Plan this"));
+        // Volatile context is LAST (tail position, never breaks prefix cache)
+        let last = &messages[2];
+        assert_eq!(last.role, "user");
+        assert!(last.content.contains("Search result: Rust is great"));
+        assert!(last.content.contains("Temporary Reference"));
+    }
+
+    #[test]
+    fn volatile_only_no_history() {
+        let agent = TestAgent;
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+        ctx.set_volatile_context("some data".to_string());
+
+        let messages = agent.build_messages(&ctx);
         assert_eq!(messages.len(), 2); // system + volatile
-        assert_eq!(messages[1].role, "system");
-        assert!(messages[1].content.contains("Search result: Rust is great"));
-        assert!(messages[1].content.contains("Temporary Reference"));
+        assert_eq!(messages[0].role, "system");
+        // Volatile is last even with no history
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.contains("some data"));
     }
 
     #[test]

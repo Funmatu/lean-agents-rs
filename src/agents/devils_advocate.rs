@@ -13,7 +13,10 @@ You are the Devil's Advocate (QA / Critic) of a multi-agent software development
 - You review the Programmer's code for specification drift, performance problems, and security holes.
 - When you approve, include the word 'Approve' in your response.
 - When you reject, include the word 'Reject' in your response.
-- If you need external information to verify claims, output: {\"action\": \"search\", \"query\": \"your search query\"}";
+
+## Tool Call Format (MANDATORY)
+When you need external information to verify claims, you MUST first explain your reasoning in plain text, then output the JSON on the same line or immediately after:
+Example: \"I need to verify this security claim. {\"action\": \"search\", \"query\": \"your search query\"}\"";
 
 pub struct DevilsAdvocateAgent;
 

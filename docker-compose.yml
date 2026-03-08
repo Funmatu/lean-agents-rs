@@ -1,0 +1,40 @@
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    command: >
+      python3 -m sglang.launch_server
+      --model-path Qwen/Qwen3.5-27B
+      --port 30000
+      --host 0.0.0.0
+      --trust-remote-code
+      --gpu-memory-utilization 0.85
+    ports:
+      - "30000:30000"
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  lean-agents:
+    build: .
+    environment:
+      SGLANG_URL: http://sglang:30000
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      RUST_LOG: info
+    depends_on:
+      sglang:
+        condition: service_healthy
+
+volumes:
+  model-cache:

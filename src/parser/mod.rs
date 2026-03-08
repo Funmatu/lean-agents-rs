@@ -2,22 +2,30 @@ use crate::domain::tool_call::ToolCallRequest;
 use crate::error::AppError;
 
 /// Parsed output from an agent's response.
+/// Speech and ToolCall can coexist — the agent's reasoning (CoT) is preserved
+/// even when a tool call is requested.
 #[derive(Debug, PartialEq, Eq)]
-pub enum AgentOutput {
-    /// Normal text response (may contain Approve/Reject directives).
-    Speech(String),
-    /// Tool call request extracted from JSON in the response.
-    ToolCall(ToolCallRequest),
+pub struct ParsedOutput {
+    /// Text surrounding the JSON (the agent's reasoning / CoT).
+    /// For pure speech responses, this is the entire output.
+    /// For tool calls, this is the text before and after the JSON block.
+    pub speech: String,
+    /// Extracted tool call request, if any.
+    pub tool_call: Option<ToolCallRequest>,
 }
 
 /// Parse an agent's raw output string into structured output.
 ///
 /// Strategy:
-/// 1. Try to find a JSON object with "action" and "query" fields.
-/// 2. If found, extract it as a ToolCallRequest.
-/// 3. Otherwise, treat the entire output as a Speech.
-pub fn parse_agent_output(raw: &str) -> Result<AgentOutput, AppError> {
+/// 1. Try to find a JSON object with "action":"search" and "query" fields.
+/// 2. If found, extract JSON as a ToolCallRequest and join surrounding text as speech.
+/// 3. Otherwise, treat the entire output as speech.
+pub fn parse_agent_output(raw: &str) -> Result<ParsedOutput, AppError> {
     let trimmed = raw.trim();
+
+    if trimmed.is_empty() {
+        return Err(AppError::Parse("empty agent output".to_string()));
+    }
 
     // Try to find JSON object in the output
     if let Some(start) = trimmed.find('{') {
@@ -31,17 +39,30 @@ pub fn parse_agent_output(raw: &str) -> Result<AgentOutput, AppError> {
                     if tool_call.query.len() > 10_000 {
                         return Err(AppError::Parse("tool call query too long".to_string()));
                     }
-                    return Ok(AgentOutput::ToolCall(tool_call));
+
+                    // Extract surrounding text as speech (CoT preservation)
+                    let before = trimmed[..start].trim();
+                    let after = trimmed[end + 1..].trim();
+                    let speech = match (before.is_empty(), after.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => before.to_string(),
+                        (true, false) => after.to_string(),
+                        (false, false) => format!("{} {}", before, after),
+                    };
+
+                    return Ok(ParsedOutput {
+                        speech,
+                        tool_call: Some(tool_call),
+                    });
                 }
             }
         }
     }
 
-    if trimmed.is_empty() {
-        return Err(AppError::Parse("empty agent output".to_string()));
-    }
-
-    Ok(AgentOutput::Speech(trimmed.to_string()))
+    Ok(ParsedOutput {
+        speech: trimmed.to_string(),
+        tool_call: None,
+    })
 }
 
 /// Find the index of the matching closing brace for the opening brace at `start`.
@@ -96,49 +117,50 @@ mod tests {
     #[test]
     fn parse_plain_speech() {
         let output = parse_agent_output("This is a design proposal.").unwrap();
-        assert_eq!(
-            output,
-            AgentOutput::Speech("This is a design proposal.".to_string())
-        );
+        assert_eq!(output.speech, "This is a design proposal.");
+        assert!(output.tool_call.is_none());
     }
 
     #[test]
-    fn parse_tool_call_json() {
+    fn parse_tool_call_with_cot() {
         let raw = r#"I need to verify this. {"action": "search", "query": "Rust async trait"}"#;
         let output = parse_agent_output(raw).unwrap();
-        match output {
-            AgentOutput::ToolCall(tc) => {
-                assert_eq!(tc.action, "search");
-                assert_eq!(tc.query, "Rust async trait");
-            }
-            _ => panic!("expected ToolCall"),
-        }
+        assert_eq!(output.speech, "I need to verify this.");
+        let tc = output.tool_call.unwrap();
+        assert_eq!(tc.action, "search");
+        assert_eq!(tc.query, "Rust async trait");
+    }
+
+    #[test]
+    fn parse_tool_call_with_cot_before_and_after() {
+        let raw = r#"Let me check. {"action": "search", "query": "test"} I'll wait for results."#;
+        let output = parse_agent_output(raw).unwrap();
+        assert_eq!(output.speech, "Let me check. I'll wait for results.");
+        assert!(output.tool_call.is_some());
     }
 
     #[test]
     fn parse_pure_json_tool_call() {
         let raw = r#"{"action": "search", "query": "tokio runtime"}"#;
         let output = parse_agent_output(raw).unwrap();
-        assert!(matches!(output, AgentOutput::ToolCall(_)));
+        assert!(output.speech.is_empty());
+        assert!(output.tool_call.is_some());
     }
 
     #[test]
     fn parse_non_search_json_as_speech() {
         let raw = r#"{"action": "other", "query": "test"}"#;
         let output = parse_agent_output(raw).unwrap();
-        assert!(matches!(output, AgentOutput::Speech(_)));
+        assert_eq!(output.speech, raw);
+        assert!(output.tool_call.is_none());
     }
 
     #[test]
     fn parse_json_with_nested_braces() {
         let raw = r#"{"action": "search", "query": "struct { field: u32 }"}"#;
         let output = parse_agent_output(raw).unwrap();
-        match output {
-            AgentOutput::ToolCall(tc) => {
-                assert_eq!(tc.query, "struct { field: u32 }");
-            }
-            _ => panic!("expected ToolCall"),
-        }
+        let tc = output.tool_call.unwrap();
+        assert_eq!(tc.query, "struct { field: u32 }");
     }
 
     #[test]
@@ -157,7 +179,8 @@ mod tests {
     fn parse_malformed_json_as_speech() {
         let raw = r#"Here is some text with { broken json"#;
         let output = parse_agent_output(raw).unwrap();
-        assert!(matches!(output, AgentOutput::Speech(_)));
+        assert_eq!(output.speech, raw);
+        assert!(output.tool_call.is_none());
     }
 
     #[test]
@@ -177,12 +200,7 @@ mod tests {
     fn json_with_escaped_quotes() {
         let raw = r#"{"action": "search", "query": "he said \"hello\""}"#;
         let output = parse_agent_output(raw).unwrap();
-        match output {
-            AgentOutput::ToolCall(tc) => {
-                assert_eq!(tc.action, "search");
-            }
-            _ => panic!("expected ToolCall"),
-        }
+        assert!(output.tool_call.is_some());
     }
 
     #[test]
