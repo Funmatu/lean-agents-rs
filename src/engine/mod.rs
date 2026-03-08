@@ -6,7 +6,7 @@ use crate::agents::devils_advocate::DevilsAdvocateAgent;
 use crate::agents::orchestrator::OrchestratorAgent;
 use crate::agents::programmer::ProgrammerAgent;
 use crate::agents::Agent;
-use crate::client::llm::LlmClient;
+use crate::client::llm::{ChatCompletionRequest, ChatMessage, LlmClient};
 use crate::client::search::SearchClient;
 use crate::domain::agent::AgentRole;
 use crate::domain::context::ContextGraph;
@@ -100,6 +100,7 @@ impl Engine {
         tx: &mpsc::Sender<EngineEvent>,
         cancel_token: tokio_util::sync::CancellationToken,
         active_interventions: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<(String, WorkflowState)>>>,
+        max_context_length: usize,
     ) -> Result<(), AppError> {
         let mut design_iterations = 0u32;
         let mut review_iterations = 0u32;
@@ -111,6 +112,33 @@ impl Engine {
                     return Err(AppError::Cancelled);
                 }
                 res = async {
+                    // Context compression check: before any major processing phase,
+                    // if the context exceeds the threshold, trigger compression.
+                    let current = context.state().clone();
+                    if matches!(
+                        current,
+                        WorkflowState::Planning
+                            | WorkflowState::Designing
+                            | WorkflowState::Implementing
+                            | WorkflowState::Reviewing
+                    ) && context.total_content_length() > max_context_length
+                    {
+                        info!(
+                            "Context length {} exceeds threshold {}, triggering compression",
+                            context.total_content_length(),
+                            max_context_length
+                        );
+                        let from = context.state().clone();
+                        context.transition_to(WorkflowState::CompressingContext {
+                            return_to: Box::new(current),
+                        })?;
+                        Self::emit(tx, EngineEvent::StateChanged {
+                            from,
+                            to: context.state().clone(),
+                        }).await;
+                        return Ok(false);
+                    }
+
                     match context.state().clone() {
                         WorkflowState::Init => {
                             Self::emit(tx, EngineEvent::WorkflowStarted {
@@ -312,6 +340,69 @@ impl Engine {
                         WorkflowState::Completed => {
                             // Exit loop successfully
                             return Ok::<bool, AppError>(true);
+                        }
+                        WorkflowState::CompressingContext { return_to } => {
+                            Self::emit(tx, EngineEvent::AgentThinking {
+                                role: AgentRole::Orchestrator,
+                            }).await;
+
+                            // Build messages from current context for the summarization call
+                            let mut messages = Vec::new();
+                            messages.push(ChatMessage {
+                                role: "system".into(),
+                                content: self.orchestrator.system_prompt().to_string(),
+                            });
+                            for msg in context.messages() {
+                                let role = if msg.sender == AgentRole::Orchestrator {
+                                    "assistant"
+                                } else {
+                                    "user"
+                                };
+                                messages.push(ChatMessage {
+                                    role: role.into(),
+                                    content: format!("[{}] {}", msg.sender, msg.content),
+                                });
+                            }
+                            // Append the summarization instruction
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: "You are the Orchestrator. The context is getting too long. \
+                                    Summarize the entire discussion history above. Include the original goal, \
+                                    finalized architectural decisions, current implementation status, and \
+                                    remaining issues. Do not use tools. Output only the summary.".into(),
+                            });
+
+                            let request = ChatCompletionRequest {
+                                model: String::new(),
+                                messages,
+                                temperature: Some(0.3),
+                                max_tokens: Some(2048),
+                                stream: None,
+                            };
+                            let summary = llm.chat_completion(request).await?;
+                            info!(
+                                "Context compressed: {} chars -> summary {} chars",
+                                context.total_content_length(),
+                                summary.len()
+                            );
+
+                            context.reset_with_summary(summary.clone());
+
+                            Self::emit(tx, EngineEvent::AgentSpoke {
+                                role: AgentRole::Orchestrator,
+                                content: format!("[Context Compressed] {}", summary),
+                            }).await;
+
+                            // Return to the original state
+                            let target = *return_to;
+                            let from = context.state().clone();
+                            context.transition_to(target.clone())?;
+                            Self::emit(tx, EngineEvent::StateChanged {
+                                from,
+                                to: target,
+                            }).await;
+
+                            Ok(false)
                         }
                         WorkflowState::ToolCalling { .. } => {
                             // This shouldn't be the top-level state evaluated here
@@ -519,7 +610,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         let _ = engine
-            .run(&mut ctx, &llm, &search, "Build a REST API", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
+            .run(&mut ctx, &llm, &search, "Build a REST API", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX)
             .await
             .unwrap();
 
@@ -560,7 +651,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         let _ = engine
-            .run(&mut ctx, &llm, &search, "Build with actix", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
+            .run(&mut ctx, &llm, &search, "Build with actix", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX)
             .await
             .unwrap();
 
@@ -596,7 +687,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         let run_future = engine
-            .run(&mut ctx, &llm, &search, "Impossible task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions);
+            .run(&mut ctx, &llm, &search, "Impossible task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), run_future).await;
 
         assert_eq!(*ctx.state(), WorkflowState::AwaitingHumanInput);
@@ -625,7 +716,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         let run_future = engine
-            .run(&mut ctx, &llm, &search, "Contentious task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions);
+            .run(&mut ctx, &llm, &search, "Contentious task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), run_future).await;
 
         assert_eq!(*ctx.state(), WorkflowState::AwaitingHumanInput);
@@ -648,7 +739,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         engine
-            .run(&mut ctx, &llm, &search, "Test self-correction", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
+            .run(&mut ctx, &llm, &search, "Test self-correction", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX)
             .await
             .unwrap();
 
@@ -676,7 +767,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         let run_future = engine
-            .run(&mut ctx, &llm, &search, "Doomed task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions);
+            .run(&mut ctx, &llm, &search, "Doomed task", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX);
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), run_future).await;
 
         // handle_escalation blocks on the channel, so the state should be AwaitingHumanInput
@@ -702,7 +793,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         engine
-            .run(&mut ctx, &llm, &search, "Test volatile cleanup", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
+            .run(&mut ctx, &llm, &search, "Test volatile cleanup", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX)
             .await
             .unwrap();
 
@@ -725,7 +816,7 @@ mod tests {
 
         let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
         engine
-            .run(&mut ctx, &llm, &search, "Event test", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions)
+            .run(&mut ctx, &llm, &search, "Event test", &tx, tokio_util::sync::CancellationToken::new(), dummy_interventions, usize::MAX)
             .await
             .unwrap();
 
@@ -747,5 +838,54 @@ mod tests {
             WorkflowState::Reviewing,
             WorkflowState::Completed,
         ]);
+    }
+
+    #[tokio::test]
+    async fn context_compression_triggers_on_threshold() {
+        // Flow with threshold=70:
+        // 1. Init→Planning: add "Build an API" (12). total=12 < 70
+        // 2. Planning: orchestrator→plan (46). total=58. →Designing
+        // 3. Designing: 58 < 70. architect→design (12), total=70. DA→approve (7), total=77. →Implementing
+        // 4. Implementing: 77 > 70 → CompressingContext! summary→"Sum". reset→checkpoint(~32). →Implementing
+        // 5. Implementing: 32 < 70. programmer→code (9). total=41. →Reviewing
+        // 6. Reviewing: 41 < 70. DA→approve. →Completed
+        let llm = MockLlmClient::new(vec![
+            "Here is a very long plan with lots of details".into(), // 0: plan (46 chars)
+            "Design: arch".into(),                                 // 1: design
+            "Approve".into(),                                      // 2: design review
+            "Sum".into(),                                          // 3: compression summary
+            "Code done".into(),                                    // 4: implementation
+            "Approve".into(),                                      // 5: final review
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+        let (tx, rx) = event_channel();
+
+        let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
+        engine
+            .run(
+                &mut ctx, &llm, &search, "Build an API",
+                &tx, tokio_util::sync::CancellationToken::new(),
+                dummy_interventions, 70,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*ctx.state(), WorkflowState::Completed);
+
+        // Verify that compression event was emitted
+        let events = collect_events(rx).await;
+        let has_compression = events.iter().any(|e| {
+            matches!(e, EngineEvent::StateChanged { to, .. }
+                if matches!(to, WorkflowState::CompressingContext { .. }))
+        });
+        assert!(has_compression, "Should have triggered context compression");
+
+        // After compression, messages should contain the summary checkpoint
+        assert!(
+            ctx.messages().iter().any(|m| m.content.contains("[System Checkpoint Summary]")),
+            "Messages should contain the summary checkpoint"
+        );
     }
 }

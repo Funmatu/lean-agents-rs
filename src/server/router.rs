@@ -104,6 +104,7 @@ async fn stream_handler(
                 &tx,
                 run_token,
                 state.active_interventions.clone(),
+                state.max_context_length,
             )
             .await;
 
@@ -170,6 +171,7 @@ mod tests {
             Arc::new(MockLlmClient::new(llm_responses)),
             Arc::new(MockSearchClient::new(vec![])),
             2,
+            crate::server::state::DEFAULT_MAX_CONTEXT_LENGTH,
         )
     }
 

@@ -61,9 +61,24 @@ def render_event(data: dict) -> Optional[str]:
         console.print("\n[bold green]▶ Workflow Started![/bold green]")
 
     elif event_type == "state_changed":
-        console.print(
-            f"[bold blue]🔄 State:[/bold blue] {data['from']} ➔ {data['to']}"
-        )
+        to_state = data["to"]
+        # Detect CompressingContext transitions (serialized as object with key)
+        if isinstance(to_state, dict) and "CompressingContext" in str(to_state):
+            console.print(
+                "[bold bright_yellow]"
+                "[🧹 Context Compression Triggered - Summarizing History...]"
+                "[/bold bright_yellow]"
+            )
+        elif isinstance(data["from"], dict) and "CompressingContext" in str(data["from"]):
+            console.print(
+                f"[bold bright_yellow]"
+                f"[🧹 Context Compression Complete - Resuming {to_state}]"
+                f"[/bold bright_yellow]"
+            )
+        else:
+            console.print(
+                f"[bold blue]🔄 State:[/bold blue] {data['from']} ➔ {to_state}"
+            )
 
     elif event_type == "agent_thinking":
         role = data["role"]

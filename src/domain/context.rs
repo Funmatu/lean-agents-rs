@@ -1,3 +1,4 @@
+use super::agent::AgentRole;
 use super::message::Message;
 use super::state::{InvalidTransition, WorkflowState};
 
@@ -48,8 +49,11 @@ impl ContextGraph {
         // Always clear volatile context on state transition
         self.volatile_context.take();
 
-        // Increment iteration only for non-ToolCalling transitions
-        if !matches!(target, WorkflowState::ToolCalling { .. }) {
+        // Increment iteration only for non-transient transitions
+        if !matches!(
+            target,
+            WorkflowState::ToolCalling { .. } | WorkflowState::CompressingContext { .. }
+        ) {
             self.iteration += 1;
         }
 
@@ -69,6 +73,21 @@ impl ContextGraph {
     /// Explicitly clear volatile context.
     pub fn clear_volatile_context(&mut self) {
         self.volatile_context.take();
+    }
+
+    /// Calculate the total character length of all message contents.
+    pub fn total_content_length(&self) -> usize {
+        self.messages.iter().map(|m| m.content.len()).sum()
+    }
+
+    /// Reset message history with a summary checkpoint.
+    /// Clears all messages and inserts a single system summary at the head.
+    pub fn reset_with_summary(&mut self, summary: String) {
+        self.messages.clear();
+        self.messages.push(Message::new(
+            AgentRole::System,
+            &format!("[System Checkpoint Summary]\n{}", summary),
+        ));
     }
 }
 
@@ -196,6 +215,48 @@ mod tests {
         assert_eq!(*ctx.state(), WorkflowState::Completed);
         assert_eq!(ctx.iteration(), 5);
         assert_eq!(ctx.messages().len(), 4);
+    }
+
+    #[test]
+    fn total_content_length_sums_all_messages() {
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+        ctx.add_message(Message::new(AgentRole::Orchestrator, "hello")); // 5
+        ctx.add_message(Message::new(AgentRole::Architect, "world!")); // 6
+        assert_eq!(ctx.total_content_length(), 11);
+    }
+
+    #[test]
+    fn reset_with_summary_clears_and_inserts_checkpoint() {
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+        ctx.add_message(Message::new(AgentRole::Orchestrator, "msg1"));
+        ctx.add_message(Message::new(AgentRole::Architect, "msg2"));
+        assert_eq!(ctx.messages().len(), 2);
+
+        ctx.reset_with_summary("This is a summary".to_string());
+        assert_eq!(ctx.messages().len(), 1);
+        assert_eq!(ctx.messages()[0].sender, AgentRole::System);
+        assert!(ctx.messages()[0].content.contains("[System Checkpoint Summary]"));
+        assert!(ctx.messages()[0].content.contains("This is a summary"));
+    }
+
+    #[test]
+    fn compressing_context_does_not_increment_iteration() {
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+        ctx.transition_to(WorkflowState::Designing).unwrap();
+        let iter_before = ctx.iteration();
+
+        ctx.transition_to(WorkflowState::CompressingContext {
+            return_to: Box::new(WorkflowState::Designing),
+        })
+        .unwrap();
+        assert_eq!(ctx.iteration(), iter_before);
+
+        // Return to Designing
+        ctx.transition_to(WorkflowState::Designing).unwrap();
+        assert_eq!(ctx.iteration(), iter_before + 1);
     }
 
     #[test]

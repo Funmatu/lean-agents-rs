@@ -9,6 +9,9 @@ use crate::domain::state::WorkflowState;
 /// Protects GX10 UMA bandwidth and SGLang KV cache from saturation.
 pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 4;
 
+/// Default maximum context length in characters before compression is triggered.
+pub const DEFAULT_MAX_CONTEXT_LENGTH: usize = 120_000;
+
 /// Shared application state for the axum server.
 /// Cloneable (all fields are Arc-wrapped) for safe sharing across handlers.
 #[derive(Clone)]
@@ -17,6 +20,7 @@ pub struct AppState {
     pub search: Arc<dyn SearchClient>,
     pub concurrency_limiter: Arc<Semaphore>,
     pub active_interventions: Arc<DashMap<String, mpsc::Sender<(String, WorkflowState)>>>,
+    pub max_context_length: usize,
 }
 
 impl AppState {
@@ -24,12 +28,14 @@ impl AppState {
         llm: Arc<dyn LlmClient>,
         search: Arc<dyn SearchClient>,
         max_concurrent_tasks: usize,
+        max_context_length: usize,
     ) -> Self {
         Self {
             llm,
             search,
             concurrency_limiter: Arc::new(Semaphore::new(max_concurrent_tasks)),
             active_interventions: Arc::new(DashMap::new()),
+            max_context_length,
         }
     }
 }
@@ -46,6 +52,7 @@ mod tests {
             Arc::new(MockLlmClient::new(vec![])),
             Arc::new(MockSearchClient::new(vec![])),
             4,
+            DEFAULT_MAX_CONTEXT_LENGTH,
         );
         let cloned = state.clone();
         // Both point to the same semaphore
@@ -61,6 +68,7 @@ mod tests {
             Arc::new(MockLlmClient::new(vec![])),
             Arc::new(MockSearchClient::new(vec![])),
             2, // Only 2 permits
+            DEFAULT_MAX_CONTEXT_LENGTH,
         );
 
         // Acquire both permits

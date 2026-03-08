@@ -11,6 +11,9 @@ pub enum WorkflowState {
     ToolCalling {
         return_to: Box<WorkflowState>,
     },
+    CompressingContext {
+        return_to: Box<WorkflowState>,
+    },
     Completed,
     Escalated,
     AwaitingHumanInput,
@@ -63,6 +66,15 @@ impl WorkflowState {
                 | WorkflowState::Reviewing
                 | WorkflowState::Completed,
             ) => true,
+
+            // CompressingContext can be entered from any active state,
+            // and returns to the state stored in return_to.
+            (_, WorkflowState::CompressingContext { .. }) => true,
+            (WorkflowState::CompressingContext { return_to }, target)
+                if return_to.as_ref() == target =>
+            {
+                true
+            }
 
             // Any state can escalate or await human input
             (_, WorkflowState::Escalated) => true,
@@ -135,6 +147,45 @@ mod tests {
                 "{state:?} should be able to escalate"
             );
         }
+    }
+
+    #[test]
+    fn compressing_context_transitions() {
+        // Any state can enter CompressingContext
+        for state in [
+            WorkflowState::Planning,
+            WorkflowState::Designing,
+            WorkflowState::Implementing,
+            WorkflowState::Reviewing,
+        ] {
+            let cc = WorkflowState::CompressingContext {
+                return_to: Box::new(state.clone()),
+            };
+            assert!(
+                state.can_transition_to(&cc),
+                "{state:?} should be able to enter CompressingContext"
+            );
+            // CompressingContext can return to the original state
+            assert!(
+                cc.can_transition_to(&state),
+                "CompressingContext should return to {state:?}"
+            );
+        }
+        // CompressingContext cannot return to a different state
+        let cc = WorkflowState::CompressingContext {
+            return_to: Box::new(WorkflowState::Designing),
+        };
+        assert!(!cc.can_transition_to(&WorkflowState::Implementing));
+    }
+
+    #[test]
+    fn compressing_context_serialization_roundtrip() {
+        let state = WorkflowState::CompressingContext {
+            return_to: Box::new(WorkflowState::Reviewing),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: WorkflowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
     }
 
     #[test]

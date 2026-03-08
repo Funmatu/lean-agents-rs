@@ -4,7 +4,7 @@ use std::sync::Arc;
 use lean_agents_rs::client::llm::SgLangClient;
 use lean_agents_rs::client::search::TavilyClient;
 use lean_agents_rs::server::router::build_router;
-use lean_agents_rs::server::state::{AppState, DEFAULT_MAX_CONCURRENT_TASKS};
+use lean_agents_rs::server::state::{AppState, DEFAULT_MAX_CONCURRENT_TASKS, DEFAULT_MAX_CONTEXT_LENGTH};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -34,6 +34,11 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS);
 
+    let max_context_length: usize = env::var("MAX_CONTEXT_LENGTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONTEXT_LENGTH);
+
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -41,7 +46,7 @@ async fn main() {
 
     let llm = Arc::new(SgLangClient::new(&sglang_url, &model));
     let search = Arc::new(TavilyClient::new(&tavily_key));
-    let state = AppState::new(llm, search, max_concurrent);
+    let state = AppState::new(llm, search, max_concurrent, max_context_length);
 
     let app = build_router(state)
         .layer(CorsLayer::permissive())
@@ -57,6 +62,7 @@ async fn main() {
     tracing::info!("  SGLang:   {sglang_url}");
     tracing::info!("  Model:    {model}");
     tracing::info!("  Max concurrent tasks: {max_concurrent}");
+    tracing::info!("  Max context length:   {max_context_length}");
 
     axum::serve(listener, app)
         .await
