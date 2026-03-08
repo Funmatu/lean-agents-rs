@@ -56,6 +56,15 @@ pub trait Agent: Send + Sync {
             });
         }
 
+        // 互換性パッチ: llama.cpp等が「Assistant Prefill」を拒否する仕様を回避するため、
+        // メッセージ配列が "assistant" で終わっている場合はダミーの "user" プロンプトを挟む。
+        if messages.last().map(|m| m.role.as_str()) == Some("assistant") {
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: "Please proceed.".into(),
+            });
+        }
+
         messages
     }
 

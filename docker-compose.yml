@@ -29,10 +29,9 @@ services:
       SGLANG_URL: http://sglang:30000
       SGLANG_MODEL: Qwen/Qwen3.5-2B
       TAVILY_API_KEY: ${TAVILY_API_KEY}
-      MAX_CONCURRENT_TASKS: 4
+      MAX_CONCURRENT_TASKS: 2 # 4
       PORT: 8080
       RUST_LOG: info
-      # MAX_CONTEXT_LENGTH: 2000 # testing with a smaller context length to reduce memory usage
       MAX_CONTEXT_LENGTH: 130000 # Recommend: 120,000 - 150,000 
     depends_on:
       sglang:
