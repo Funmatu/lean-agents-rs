@@ -104,6 +104,7 @@ impl Engine {
     ) -> Result<(), AppError> {
         let mut design_iterations = 0u32;
         let mut review_iterations = 0u32;
+        let mut just_compressed = false;
 
         loop {
             tokio::select! {
@@ -114,8 +115,9 @@ impl Engine {
                 res = async {
                     // Context compression check: before any major processing phase,
                     // if the context exceeds the threshold, trigger compression.
+                    // Skip if we just compressed (prevents infinite loop when summary > threshold).
                     let current = context.state().clone();
-                    if matches!(
+                    if !just_compressed && matches!(
                         current,
                         WorkflowState::Planning
                             | WorkflowState::Designing
@@ -138,6 +140,9 @@ impl Engine {
                         }).await;
                         return Ok(false);
                     }
+
+                    // Reset the guard once we proceed past the compression check
+                    just_compressed = false;
 
                     match context.state().clone() {
                         WorkflowState::Init => {
@@ -402,6 +407,7 @@ impl Engine {
                                 to: target,
                             }).await;
 
+                            just_compressed = true;
                             Ok(false)
                         }
                         WorkflowState::ToolCalling { .. } => {
@@ -887,5 +893,40 @@ mod tests {
             ctx.messages().iter().any(|m| m.content.contains("[System Checkpoint Summary]")),
             "Messages should contain the summary checkpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn context_compression_no_infinite_loop_with_tiny_threshold() {
+        // With threshold=1, the summary checkpoint itself always exceeds the threshold.
+        // The just_compressed guard must prevent re-triggering compression indefinitely.
+        // Extra summary responses are provided in case compression fires multiple times.
+        let llm = MockLlmClient::new(vec![
+            "Plan".into(),          // 0: plan
+            "S".into(),             // 1: summary (checkpoint ~30 chars > 1)
+            "Design".into(),        // 2: design
+            "Approve".into(),       // 3: design review
+            "S".into(),             // 4: summary for Implementing
+            "Code".into(),          // 5: implementation
+            "S".into(),             // 6: summary for Reviewing
+            "Approve".into(),       // 7: final review
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+        let (tx, _rx) = event_channel();
+
+        let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
+        // threshold=1: compression triggers every phase, but just_compressed prevents loops
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.run(
+                &mut ctx, &llm, &search, "X",
+                &tx, tokio_util::sync::CancellationToken::new(),
+                dummy_interventions, 1,
+            ),
+        ).await;
+
+        assert!(result.is_ok(), "Should not hang in infinite loop");
+        assert_eq!(*ctx.state(), WorkflowState::Completed);
     }
 }

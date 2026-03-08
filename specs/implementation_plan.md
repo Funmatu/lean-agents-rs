@@ -1,57 +1,45 @@
-# 🤖 AIコーダーへの実装指示：【Phase 3】 コンテキストの要約圧縮・リセット機能（Context Compression）
+# 🤖 AIコーダーへの実装指示：【Phase 4】 実機パフォーマンステスト・スクリプトの作成
 
-プロジェクトの目標を「実稼働（Production）レベルでの連続稼働」に引き上げます。
-現在のアーキテクチャでは、タスクが長引くと `ContextGraph` の `messages` が単調増加し続け、いずれ限界を迎えます。パフォーマンステストを行う前に、**Phase 3** として、会話履歴が一定量を超えた際に Orchestrator に要約を行わせ、コンテキストをリセットする「Context Compression」機構を実装します。
+【Phase 3】のコンテキスト圧縮機能、完璧に機能しています！エージェントがハルシネーションを起こしても、圧縮リセットによってコンテキストが浄化され、本来のタスクに引き戻される自己修復プロセスが確認できました。
 
-ただし、私たちが使用するLLM（Qwen3.5-27B）は最大262kトークンの巨大なコンテキストウィンドウを持っています。固定値で小さく制限するのではなく、環境変数で柔軟に制御できるアーキテクチャにします。
+いよいよ本プロジェクトの最終フェーズである **【Phase 4】 実機パフォーマンステスト・スクリプトの作成** に着手してください。
+ASUS GX10 (UMAアーキテクチャ) の限られたメモリ帯域(273GB/s)に対して、現在の `MAX_CONCURRENT_TASKS` (セマフォ) の値が最適かどうかを計測するためのシェルスクリプトを作成します。
 
 ## 🛠️ 実装手順
 
-### 3-1. Domain層の更新 (`src/domain/`)
+### 4-1. `scripts/profile_uma.sh` の作成
 
-1. **`state.rs`:**
-* `WorkflowState` Enum に `CompressingContext { return_to: Box<WorkflowState> }` を追加せよ。
-* `can_transition_to` を更新し、すべての状態から `CompressingContext` への遷移、および `CompressingContext` から任意の元の状態への遷移を許可せよ。
+リポジトリのルートに `scripts` ディレクトリを作成し、その中に `profile_uma.sh` を作成してください。
+このスクリプトは以下のフローを自動化します。
 
-
-2. **`context.rs`:**
-* `ContextGraph` に、現在の全メッセージの総文字数を計算するメソッド `total_content_length(&self) -> usize` を追加せよ。
-* メッセージ履歴をリセットするメソッド `reset_with_summary(&mut self, summary: String)` を実装せよ。これは内部の `messages` を `clear` し、先頭に `Message::new(AgentRole::System, format!("[System Checkpoint Summary]\n{}", summary))` を挿入する処理とする。
+1. **ヘッダーと準備:**
+* `set -e` でエラー時に停止するようにする。
+* 必要なコマンド (`nvidia-smi`, `uv`, `awk`) がインストールされているかチェックする。
 
 
-
-### 3-2. AppState と Engine層の更新
-
-1. **`src/server/state.rs` & `src/main.rs`:**
-* 環境変数 `MAX_CONTEXT_LENGTH` を読み込む処理を追加せよ（パースできない場合や未指定時のデフォルトは `120000` 文字とする）。
-* `AppState` に `max_context_length: usize` を追加し、起動時にセットせよ。
+2. **バックグラウンド・プロファイリングの開始:**
+* `nvidia-smi dmon -s m -d 1 > uma_bandwidth.log &` を実行し、1秒ごとのGPUメモリ/PCIe帯域使用状況をログファイルに記録し始める。
+* 起動したバックグラウンドプロセスのPID (`$!`) を保持しておく。
 
 
-2. **`src/engine/mod.rs`:**
-* `Engine::run` の引数に `max_context_length: usize` を追加（Router側から渡す）せよ。
-* ステートマシンループ内において、`Planning`, `Designing`, `Implementing`, `Reviewing` などの主要な処理を行う**直前**に、`context.total_content_length() > max_context_length` をチェックするロジックを挿入せよ。
+3. **負荷テストの実行:**
+* 以前作成した `tools/cli_client/client.py` ではなく、自動テスト用に作成した `tests/test_runner.py` に実装されている「4. [Concurrency] 5タスク同時実行」を非対話モードで実行する。
+* *(※ `echo "4" | uv run tests/test_runner.py` のように標準入力をパイプするか、Pythonスクリプト側に特定の引数を受け取る処理を追加してください)*
 
 
-3. もし閾値を超えていた場合：
-* 現在の `context.state()` を `return_to` に保持した上で、`WorkflowState::CompressingContext` へ `transition_to` し、`StateChanged` イベントを発火せよ。
-* `continue;` を呼び出してループを回し、`CompressingContext` アームに入らせよ。
-
-
-4. `WorkflowState::CompressingContext` のマッチアームを実装せよ：
-* クライアントに `AgentThinking { role: AgentRole::Orchestrator }` を発火。
-* Orchestrator を用いて、LLMに特別タスクを投げる。この際、通常の `execute_with_tool_support` ではなく、一時的なプロンプトとして「*You are the Orchestrator. The context is getting too long. Summarize the entire discussion history above. Include the original goal, finalized architectural decisions, current implementation status, and remaining issues. Do not use tools. Output only the summary.*」を末尾に付与して `llm.chat_completion` を直接叩くこと（コンテキストは現在の `build_messages` を活用）。
-* 結果が得られたら、`context.reset_with_summary(summary)` を呼び出す。
-* `return_to` に保持していた元の状態へ `transition_to` し、ループを継続せよ。
+4. **プロファイリングの終了と集計:**
+* Pythonスクリプトの実行が完了したら、保持していたPIDを使って `kill` コマンドで `nvidia-smi dmon` を終了させる。
+* `awk` などのテキスト処理コマンドを用いて、`uma_bandwidth.log` からメモリスループット（`rxpci`, `txpci` 等、`dmon -s m` で出力される帯域関連の列）の **最大値 (Max)** と **平均値 (Average)** を計算し、ターミナルに分かりやすく表示する。
 
 
 
-### 3-3. CLIクライアントの更新 (`tools/cli_client/client.py`)
+### 4-2. `tests/test_runner.py` の微修正 (必要であれば)
 
-* 新たな状態遷移（`CompressingContext` への出入り）がストリームで流れてきた際、コンソールに目立つ色で `[🧹 Context Compression Triggered - Summarizing History...]` のように表示し、ユーザーに何が起きているか視覚的に伝わるようにせよ。
+* もし現在の `test_runner.py` が対話プロンプト専用で自動実行しにくい場合、コマンドライン引数（例: `--run-concurrent`）を受け取ったら即座に `test_concurrent_execution()` を実行して終了するような簡単な改修を行ってください。
 
-### ✅ Phase 3 完了条件
+### ✅ Phase 4 完了条件
 
-* `cargo check` と `cargo test` がすべて通ること。
-* アプリケーションの起動時に `MAX_CONTEXT_LENGTH=2000` のように極端に小さい値を設定してCLIから少し長めのタスクを投げ、意図的に文字数を溢れさせて、自動的に要約が走り、履歴が圧縮されて元のフェーズに復帰する様子（ログ表示）が確認できること。
+* `scripts/profile_uma.sh` に実行権限 (`chmod +x`) が付与できるスクリプトとして記述されていること。
+* スクリプトを実行すると、バックグラウンドでメトリクスを取得しつつ負荷テストが走り、最後に平均帯域幅などのレポートが出力される構造になっていること。
 
-実装とテストが完了しましたら、修正されたコード（diff）と、テストで圧縮がトリガーされた際のCLIの動作ログを報告してください。
+実装が完了しましたら、作成したシェルスクリプトのコードと、もし修正があればPythonスクリプトのdiffを出力してください。これで全Phaseが完了となります！

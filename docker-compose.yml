@@ -32,6 +32,8 @@ services:
       MAX_CONCURRENT_TASKS: 4
       PORT: 8080
       RUST_LOG: info
+      # MAX_CONTEXT_LENGTH: 2000 # testing with a smaller context length to reduce memory usage
+      MAX_CONTEXT_LENGTH: 130000 # Recommend: 120,000 - 150,000 
     depends_on:
       sglang:
         condition: service_healthy
