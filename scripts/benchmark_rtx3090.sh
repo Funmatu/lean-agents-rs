@@ -34,8 +34,8 @@ trap cleanup EXIT
 # --- Markdown Report Initialization ---
 echo "# RTX 3090 Benchmark Results" > "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
-echo "| Model | Engine | Peak VRAM (MB) | Time (sec) | Approx System T/s | Output Log |" >> "$REPORT_FILE"
-echo "|---|---|---|---|---|---|" >> "$REPORT_FILE"
+echo "| Model | Engine | Peak VRAM (MB) | Time (sec) | Approx System T/s | Status | Output Log |" >> "$REPORT_FILE"
+echo "|---|---|---|---|---|---|---|" >> "$REPORT_FILE"
 
 # --- Main Benchmark Loop ---
 for MODEL_ENTRY in "${MODELS[@]}"; do
@@ -55,7 +55,7 @@ for MODEL_ENTRY in "${MODELS[@]}"; do
             FILE_NAME="$ARG1"
             CTX_SIZE="$ARG2"
             DL_URL="https://huggingface.co/${MODEL_ID}/resolve/main/${FILE_NAME}"
-            
+
             # entrypoint を最も堅牢な YAML リスト形式に変更し、curl の自動インストールも追加
             ENTRYPOINT_BLOCK="    entrypoint:
           - /bin/sh
@@ -143,9 +143,31 @@ EOF
     START_TIME=$(date +%s)
     
     RAW_LOG="${LOG_DIR}/${DISPLAY_NAME}_raw.jsonl"
+    > "$RAW_LOG" # ログファイルを初期化
+
+    # curlをバックグラウンドで実行
     curl -s -N -X POST http://localhost:8080/v1/agent/stream \
          -H "Content-Type: application/json" \
-         -d "{\"task\": \"${TASK_PROMPT}\"}" > "$RAW_LOG"
+         -d "{\"task\": \"${TASK_PROMPT}\"}" > "$RAW_LOG" &
+    CURL_PID=$!
+
+    # ログを2秒間隔で監視し、終了イベントを検知したらストリームを強制切断
+    IS_SUCCESS="Unknown"
+    while kill -0 $CURL_PID 2>/dev/null; do
+        if grep -q '"type":"workflow_completed"' "$RAW_LOG"; then
+            echo "[INFO] ✅ Workflow Completed successfully!"
+            IS_SUCCESS="✅ Success"
+            kill -INT $CURL_PID 2>/dev/null || true
+            break
+        elif grep -q '"type":"workflow_escalated"' "$RAW_LOG"; then
+            echo "[INFO] 🚨 Workflow Escalated (Failed). Moving to next model..."
+            IS_SUCCESS="❌ Failed"
+            kill -INT $CURL_PID 2>/dev/null || true
+            break
+        fi
+        sleep 2
+    done
+    wait $CURL_PID 2>/dev/null || true
          
     END_TIME=$(date +%s)
     TOTAL_TIME=$((END_TIME - START_TIME))
@@ -162,9 +184,9 @@ EOF
         TOKEN_PER_SEC="0.0"
     fi
 
-    echo "[RESULT] Time: ${TOTAL_TIME}s, Peak VRAM: ${PEAK_VRAM}MB, Approx T/s: ${TOKEN_PER_SEC}"
+    echo "[RESULT] Status: ${IS_SUCCESS}, Time: ${TOTAL_TIME}s, Peak VRAM: ${PEAK_VRAM}MB, Approx T/s: ${TOKEN_PER_SEC}"
 
-    echo "| **$DISPLAY_NAME** | $ENGINE | $PEAK_VRAM | $TOTAL_TIME | $TOKEN_PER_SEC | [Log](./${DISPLAY_NAME}_raw.jsonl) |" >> "$REPORT_FILE"
+    echo "| **$DISPLAY_NAME** | $ENGINE | $PEAK_VRAM | $TOTAL_TIME | $TOKEN_PER_SEC | $IS_SUCCESS | [Log](./${DISPLAY_NAME}_raw.jsonl) |" >> "$REPORT_FILE"
 
     docker compose -f docker-compose.bench.yml down -v >/dev/null 2>&1
     sleep 3

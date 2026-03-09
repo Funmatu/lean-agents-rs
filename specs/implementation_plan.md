@@ -1,77 +1,119 @@
-# 🤖 AIコーダーへの実装指示書：LLM推論エンジン間のAPI互換性レイヤー実装
+# 🤖 AIコーダーへの実装指示書：ステートマシンの仕様補完とベンチマーク基盤の堅牢化
 
-## 1. プロジェクト背景と現在の課題
+## 1. プロジェクト背景とデータ駆動（DDD）による課題分析
 
-本プロジェクト `lean-agents-rs` は、Rustで構築された自律型マルチエージェントシステムです。SGLang をプライマリ推論エンジンとして開発されてきましたが、現在、RTX 3090 環境でのベンチマーク検証のために `llama.cpp` (`llama-server`) との統合テストを行っています。
+現在、`lean-agents-rs` プロジェクトにおける RTX 3090 でのマルチモデル・ベンチマーク（`scripts/benchmark_rtx3090.sh`）実行中に、以下の2つの独立したクリティカルなバグが観測されている。
 
-しかし、`llama.cpp` バックエンドを使用した場合、初期タスク投入後の Orchestrator エージェントの初回推論時に以下のエラーが発生してワークフローがクラッシュします。
+**【課題A：Rustドメイン層における不正な状態遷移例外】**
 
-**エラーログ:**
+* **観測データ (Log):** `data: {"type":"workflow_escalated","reason":"Invalid state transition: invalid state transition from Planning to ToolCalling { return_to: Planning }","task_id":null}`
+* **Root Cause:** Orchestratorエージェントが、タスク分解を行う前に前提知識を調べるため `Planning` フェーズで Tool Call（検索）をリクエストした。しかし `src/domain/state.rs` の `WorkflowState::can_transition_to` メソッドにおいて、`Planning` -> `ToolCalling` への遷移ルールが明示的に定義されておらず、ステートマシンがクラッシュした。
 
-```json
-data: {"type":"workflow_escalated","reason":"LLM client error: HTTP 400 Bad Request: {\"error\":{\"code\":400,\"message\":\"Assistant response prefill is incompatible with enable_thinking.\",\"type\":\"invalid_request_error\"}}","task_id":null}
+**【課題B：シェルスクリプトのパイプライン崩壊とレポート初期化問題】**
+
+* **観測データ:** エスカレーション発生時、スクリプトが異常終了し、次回の再実行時に前回までのベンチマーク結果（Markdown）が消滅している。
+* **Root Cause:** 1. スクリプト冒頭で `set -euo pipefail` を宣言しているため、エージェントが一度も発言（`agent_spoke`）せずにエラー終了した場合、`grep '"type":"agent_spoke"'` が `Exit Code 1` を返し、スクリプト全体が即死する。
+2. スクリプト冒頭で `> "$REPORT_FILE"`（上書き）を使用しているため、再実行時に過去の結果がすべて初期化されてしまう。
+
+---
+
+## 2. 仕様駆動開発（SDD）に基づく要件定義
+
+本システムの堅牢性を担保するため、以下の仕様を満たすこと。
+
+**仕様 1: ステートマシンの拡張 (Rust)**
+
+* `Planning` フェーズは、外部情報の調査を伴う可能性があるため、`ToolCalling` 状態への一時的な遷移をドメインとして正式に許可する。
+* 変更対象: `src/domain/state.rs` の `can_transition_to` メソッド。
+
+**仕様 2: レポートファイルの永続化 (Bash)**
+
+* ベンチマークレポート（`benchmark_report.md`）は、ファイルが**存在しない場合のみ**ヘッダーを初期化し、存在する場合は追記（Append）を継続する仕様とする。
+
+**仕様 3: パイプライン・セーフな解析ロジック (Bash)**
+
+* ログの解析処理（`TOTAL_CHARS` の計算）において、検索対象の文字列が存在しなくてもスクリプトがクラッシュしない「パイプライン・セーフ」な実装を導入する。
+
+---
+
+## 3. テスト駆動開発（TDD）に基づく実装手順
+
+AIコーダーは、以下のStep 1〜4の順序で厳格に実装とテストを行うこと。
+
+### Step 1: Rustドメイン層のテスト追加と実装
+
+1. **テストの記述 (Red):**
+`src/domain/state.rs` 内の `mod tests` にある `valid_transitions` テスト、または新規テスト `planning_to_toolcalling_transition` を作成し、以下をアサートせよ。
+```rust
+let tool_state = WorkflowState::ToolCalling { return_to: Box::new(WorkflowState::Planning) };
+assert!(WorkflowState::Planning.can_transition_to(&tool_state));
 
 ```
 
-## 2. データ駆動の分析 (Root Cause Analysis)
 
-1. **ドメインモデルの現状:**
-システムはユーザーからの初回タスクを `AgentRole::Orchestrator` の発言として `ContextGraph` に登録します。これはマルチエージェントシステムの内部ステートとして「Orchestratorの初期目標」を表現する正しいドメインモデリングです。
-2. **SGLang と llama.cpp の仕様差異:**
-* **SGLang:** チャット履歴の末尾が `assistant` ロールであっても、それを Assistant Prefill（回答の書き出し）として認識し、シームレスに推論を継続します。
-* **llama.cpp:** 最新版では `enable_thinking` 機能との競合により、OpenAI互換APIエンドポイントにおいて「末尾が `assistant` ロールであること（Assistant Prefill）」を厳格に拒否し、HTTP 400 エラーを返却します。
+2. **実装 (Green):**
+同ファイル内の `can_transition_to` メソッドにおける `Planning` の遷移ルールに以下を追加せよ。
+```rust
+(WorkflowState::Planning, WorkflowState::ToolCalling { .. }) => true,
 
-
-
-## 3. 仕様駆動開発 (SDD) に基づく要件定義
-
-**【絶対的な制約】**
-ドメイン層 (`src/domain/` 内の `ContextGraph`, `Message`, `AgentRole`) およびステートマシン (`src/engine/mod.rs`) のコアロジックは**一切変更してはならない**。ドメインの純粋性を保つこと。
-
-**【実装要件】**
-API通信を構築するアダプター層（`src/agents/mod.rs` の `build_messages` メソッド、または `src/client/llm.rs`）において、推論エンジンに依存しない堅牢な互換性レイヤーを実装せよ。
-
-1. `ContextGraph` から LLM API 用の `Vec<ChatMessage>` を構築する際、メッセージの連続性や末尾のロールを検査・変換するロジックを導入すること。
-2. LLMAPI に送信される `messages` 配列の最後は、必ず `user` または `system` で終わるように保証すること。
-3. もし `AgentRole::Orchestrator` 等のエージェント自身の発言（`assistant` ロールにマッピングされる）が末尾にある場合は、推論エンジンが拒否しない形（例：ダミーの `user` メッセージの挿入、または初回タスクのみ `user` ロールとしてAPIに送信する等）に適切にマッピングすること。
-
-## 4. テスト駆動開発 (TDD) に基づく実装手順
-
-以下のステップに沿って実装および検証を行ってください。
-
-### Step 1: 既存テストの実行と状態確認
-
-* `cargo test` を実行し、既存のドメインロジックおよび `src/agents/mod.rs` のテスト（`build_messages_without_volatile_context` 等）がパスすることを確認せよ。
-
-### Step 2: 失敗する単体テストの追加
-
-* `src/agents/mod.rs` のテストモジュール内に、`llama.cpp` の制約をシミュレートするテストを追加せよ。
-* **テスト名:** `test_build_messages_prevents_assistant_prefill`
-* **条件:** `ContextGraph` に `AgentRole::Orchestrator` のメッセージのみが存在する場合。
-* **アサーション:** 構築された `Vec<ChatMessage>` の最後の要素の `role` が `"assistant"` ではないこと（`"user"` であること）を検証する。
+```
 
 
+3. **検証 (Refactor):**
+`cargo test domain::state::tests` を実行し、テストがPASSすることを証明せよ。
 
-### Step 3: 互換性レイヤーの実装
+### Step 2: ベンチマークスクリプトの堅牢化 (1) - レポート初期化防止
 
-* `src/agents/mod.rs` の `Agent::build_messages` トレイトメソッドを改修し、追加したテストがパスするようにせよ。
-* 修正方針の例：
-履歴をループして `ChatMessage` を生成した後、`messages.last().map(|m| m.role.as_str()) == Some("assistant")` の条件に合致する場合、`role: "user", content: "Please proceed with the task."` のようなトリガーメッセージを Append する。
-※前回の簡易な修正では失敗したため、llama.cppのパーサーが確実に認識できるフォーマットを検討すること。あるいは、初回のタスク投入時（メッセージ配列の長さが2の場合など）に限り、送信元のロールマッピングを動的に `user` に変更するアプローチも検討せよ。
+`scripts/benchmark_rtx3090.sh` の `Markdown Report Initialization` ブロック（41行目付近）を以下のように書き換えよ。
 
-### Step 4: ビルドと単体テストの通過
+```bash
+# --- Markdown Report Initialization ---
+if [[ ! -f "$REPORT_FILE" ]]; then
+    echo "# RTX 3090 Benchmark Results" > "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo "| Model | Engine | Peak VRAM (MB) | Time (sec) | Approx System T/s | Status | Output Log |" >> "$REPORT_FILE"
+    echo "|---|---|---|---|---|---|---|" >> "$REPORT_FILE"
+else
+    echo "[INFO] Existing report file found. Appending results..."
+fi
 
-* `cargo build` および `cargo test` が完全にパスすることを保証せよ。
+```
 
-### Step 5: 統合テスト（ベンチマークスクリプトの実行）
+### Step 3: ベンチマークスクリプトの堅牢化 (2) - パイプライン・セーフティ
 
-* 提供されている `scripts/benchmark_rtx3090.sh` を使用して、実際に `llama.cpp` バックエンドを立ち上げて結合テストを行え。
-* **重要:** スクリプト内の `docker compose` コマンドには必ず `--build` フラグを付与し、修正したRustバイナリがコンテナにデプロイされるようにすること。
+同スクリプト内の `TOTAL_CHARS` および `APPROX_TOKENS` の計算ブロック（135行目付近）を、`set -e` の監視下でも絶対に落ちないロジック（`if` 文による `grep -q` の事前チェック）に書き換えよ。
 
-## 5. 期待される成果物
+```bash
+    # 安全な文字数カウント（パイプエラー回避）
+    TOTAL_CHARS=0
+    if grep -q '"type":"agent_spoke"' "$RAW_LOG" 2>/dev/null; then
+        TOTAL_CHARS=$(grep '"type":"agent_spoke"' "$RAW_LOG" | sed 's/data: //' | jq -r '.content' | wc -m)
+    fi
+    
+    # 欠損値対策
+    if [[ -z "$TOTAL_CHARS" || ! "$TOTAL_CHARS" =~ ^[0-9]+$ ]]; then
+        TOTAL_CHARS=0
+    fi
+    APPROX_TOKENS=$((TOTAL_CHARS / 4))
 
-1. `src/agents/mod.rs` の改修コード（互換性レイヤーの完全な実装）。
-2. 同ファイル内に追加された単体テストコード。
-3. 実行結果のログ（`HTTP 400 Bad Request` が解消され、Orchestrator が `Planning` フェーズの推論を正常に完了し、エージェントループが回ることの証明）。
+```
 
-さあ、システムの堅牢性をさらに一段階引き上げるための実装を開始してください。
+### Step 4: キャッシュの強制破棄と再ビルド
+
+コードの修正が完了したら、前回のように古いDockerイメージのキャッシュが効いてしまうのを防ぐため、必ず以下のコマンドを実行して最新のRustバイナリをコンテナにデプロイせよ。
+
+```bash
+docker compose -f docker-compose.bench.yml down -v || true
+docker rmi lean-agents-rs-lean-agents:latest -f || true
+docker compose -f docker-compose.bench.yml build --no-cache lean-agents
+
+```
+
+## 4. 完了条件
+
+* `cargo test` の全件PASS。
+* Orchestratorエージェントが `Planning` フェーズで正常に検索ツールを呼び出せること。
+* エージェントが発言せずにエスカレーションしてもスクリプトが異常終了せず、次のモデルのテストに正常に移行すること。
+* ベンチマーク結果がMarkdownファイルに追記され続けること。
+
+作業を開始してください。

@@ -56,12 +56,15 @@ pub trait Agent: Send + Sync {
             });
         }
 
-        // 互換性パッチ: llama.cpp等が「Assistant Prefill」を拒否する仕様を回避するため、
-        // メッセージ配列が "assistant" で終わっている場合はダミーの "user" プロンプトを挟む。
+        // llama.cpp compatibility: prevent assistant prefill.
+        // llama.cpp rejects requests where the last message has role "assistant"
+        // when enable_thinking is active (HTTP 400: "Assistant response prefill
+        // is incompatible with enable_thinking."). We append a user-role trigger
+        // message to ensure the array always ends with "user".
         if messages.last().map(|m| m.role.as_str()) == Some("assistant") {
             messages.push(ChatMessage {
                 role: "user".into(),
-                content: "Please proceed.".into(),
+                content: "Continue your analysis based on the context above.".into(),
             });
         }
 
@@ -169,5 +172,75 @@ mod tests {
         // system + 2 history messages
         assert_eq!(messages[1].role, "assistant"); // Architect's own message
         assert_eq!(messages[2].role, "user"); // Programmer's message
+    }
+
+    /// llama.cpp compatibility: when the only history message belongs to the
+    /// agent itself, the raw mapping would produce a trailing "assistant" role,
+    /// which llama.cpp rejects with HTTP 400 ("Assistant response prefill is
+    /// incompatible with enable_thinking."). The compatibility layer must
+    /// append a "user" trigger message to prevent this.
+    #[test]
+    fn test_build_messages_prevents_assistant_prefill() {
+        let agent = TestAgent; // role = Architect
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+
+        // Only the agent's own message exists → would map to role "assistant"
+        ctx.add_message(Message::new(AgentRole::Architect, "Initial design draft"));
+
+        let messages = agent.build_messages(&ctx);
+
+        // The last message MUST NOT be "assistant" (llama.cpp constraint)
+        let last = messages.last().unwrap();
+        assert_ne!(
+            last.role, "assistant",
+            "build_messages must never end with assistant role (llama.cpp compatibility)"
+        );
+        assert_eq!(last.role, "user");
+
+        // Verify structure: system + assistant(own) + user(trigger)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    /// Verify the compatibility layer also activates when multiple consecutive
+    /// messages from the same agent end the history.
+    #[test]
+    fn test_build_messages_prevents_assistant_prefill_multiple_own_messages() {
+        let agent = TestAgent; // role = Architect
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+
+        ctx.add_message(Message::new(AgentRole::Architect, "Draft v1"));
+        ctx.add_message(Message::new(AgentRole::Architect, "Draft v2 revision"));
+
+        let messages = agent.build_messages(&ctx);
+
+        let last = messages.last().unwrap();
+        assert_ne!(last.role, "assistant");
+        assert_eq!(last.role, "user");
+    }
+
+    /// When volatile context is present, it's already a "user" message at the
+    /// tail, so the compatibility patch should NOT fire (no extra message).
+    #[test]
+    fn test_volatile_context_prevents_assistant_prefill_naturally() {
+        let agent = TestAgent;
+        let mut ctx = ContextGraph::new();
+        ctx.transition_to(WorkflowState::Planning).unwrap();
+
+        // Own message → would be "assistant"
+        ctx.add_message(Message::new(AgentRole::Architect, "My analysis"));
+        // But volatile context adds a "user" message at tail
+        ctx.set_volatile_context("Search results here".to_string());
+
+        let messages = agent.build_messages(&ctx);
+
+        // system + assistant(own) + user(volatile) — no extra trigger needed
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, "user");
+        assert!(messages[2].content.contains("Search results here"));
     }
 }
