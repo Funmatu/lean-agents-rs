@@ -32,8 +32,9 @@ impl WorkflowState {
             // Init can go to Planning
             (WorkflowState::Init, WorkflowState::Planning) => true,
 
-            // Planning can go to Designing or Escalated
+            // Planning can go to Designing, ToolCalling, or Escalated
             (WorkflowState::Planning, WorkflowState::Designing) => true,
+            (WorkflowState::Planning, WorkflowState::ToolCalling { .. }) => true,
             (WorkflowState::Planning, WorkflowState::Escalated) => true,
 
             // Designing can go to Implementing, ToolCalling, or Escalated
@@ -186,6 +187,21 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: WorkflowState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn planning_to_toolcalling_transition() {
+        // Planning -> ToolCalling (往路)
+        let tool_state = WorkflowState::ToolCalling {
+            return_to: Box::new(WorkflowState::Planning),
+        };
+        assert!(WorkflowState::Planning.can_transition_to(&tool_state));
+
+        // ToolCalling -> Planning (復路)
+        assert!(tool_state.can_transition_to(&WorkflowState::Planning));
+
+        // ToolCalling from Planning should NOT return to a different state
+        assert!(!tool_state.can_transition_to(&WorkflowState::Designing));
     }
 
     #[test]

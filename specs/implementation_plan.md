@@ -1,119 +1,42 @@
-# 🤖 AIコーダーへの実装指示書：ステートマシンの仕様補完とベンチマーク基盤の堅牢化
+# 🤖 AIコーダーへの指示：プロダクションレベル（世界最高水準）の堅牢化とアーキテクチャ監査
 
-## 1. プロジェクト背景とデータ駆動（DDD）による課題分析
+## 1. プロジェクトの現状とあなたの役割
+あなたは世界最高水準のシニアRustアーキテクトです。
+現在開発中の自律型マルチエージェントシステム `lean-agents-rs` において、概念実証（PoC）レベルの実装から、エッジケースやLLMの不安定な出力にも絶対にクラッシュしない「堅牢なプロダクションレベル」への引き上げを行います。
 
-現在、`lean-agents-rs` プロジェクトにおける RTX 3090 でのマルチモデル・ベンチマーク（`scripts/benchmark_rtx3090.sh`）実行中に、以下の2つの独立したクリティカルなバグが観測されている。
+現在、以下の2つの重大なシステム欠陥が観測されています。
+1. **状態遷移のすり抜け（State Transition Leak）:** DevilsAdvocateエージェントが明確に "Reject" を出力しているにもかかわらず、システムが `Designing` から `Implementing` へと誤って遷移してしまった。出力のパースロジック、あるいは遷移条件の評価が甘い。
+2. **コンテキスト溢れによるストリーム切断:** 長時間の議論によりメッセージ履歴が肥大化し、LLMエンジン（llama.cpp / SGLang）のコンテキスト限界に達して無言でストリームが切断される事象が発生した。
 
-**【課題A：Rustドメイン層における不正な状態遷移例外】**
+## 2. 仕様駆動開発 (SDD) に基づくアーキテクチャ要件
 
-* **観測データ (Log):** `data: {"type":"workflow_escalated","reason":"Invalid state transition: invalid state transition from Planning to ToolCalling { return_to: Planning }","task_id":null}`
-* **Root Cause:** Orchestratorエージェントが、タスク分解を行う前に前提知識を調べるため `Planning` フェーズで Tool Call（検索）をリクエストした。しかし `src/domain/state.rs` の `WorkflowState::can_transition_to` メソッドにおいて、`Planning` -> `ToolCalling` への遷移ルールが明示的に定義されておらず、ステートマシンがクラッシュした。
+これらの課題を解決するため、以下の3つの柱でシステムを監査・再設計・実装してください。
 
-**【課題B：シェルスクリプトのパイプライン崩壊とレポート初期化問題】**
+### 要件A: Rustの型システムを活用した厳格な意思決定（Decision）パース
+現在、LLMの出力テキストから単純な文字列マッチ（例: `contains("Reject")`）で判定している場合、誤検知やパース漏れが発生します。
+* `src/domain/decision.rs` のようなモジュールを新設し、エージェントのレビュー結果を表現する厳格な Enum (`enum ReviewDecision { Approve, Reject(String), RequestRevision(String) }`) を定義せよ。
+* LLMの出力からこの `ReviewDecision` を確定的に抽出する堅牢なパーサーを実装せよ（最後に明言された判定を優先する、等のロジックを含む）。
 
-* **観測データ:** エスカレーション発生時、スクリプトが異常終了し、次回の再実行時に前回までのベンチマーク結果（Markdown）が消滅している。
-* **Root Cause:** 1. スクリプト冒頭で `set -euo pipefail` を宣言しているため、エージェントが一度も発言（`agent_spoke`）せずにエラー終了した場合、`grep '"type":"agent_spoke"'` が `Exit Code 1` を返し、スクリプト全体が即死する。
-2. スクリプト冒頭で `> "$REPORT_FILE"`（上書き）を使用しているため、再実行時に過去の結果がすべて初期化されてしまう。
+### 要件B: 絶対に不正遷移を起こさないステートマシン（State Machine）
+* `src/engine/mod.rs` および `src/domain/state.rs` を監査し、**「レビュー担当者（DevilsAdvocate等）の `ReviewDecision` が `Approve` でない限り、絶対に次の開発フェーズ（ImplementingやTesting）へ遷移させない」** ロジックをRustの型システムレベルで保証せよ。
+* `Reject` の場合は、確実に該当フェーズの担当エージェント（Architect等）に手番を戻し、最大イテレーション数に達した場合は `Escalated` に遷移するロジックを再確認・強化せよ。
 
----
+### 要件C: 推論エンジンに依存しないコンテキスト管理（Context Window Management）
+* `src/domain/context.rs` または `ContextGraph` において、履歴の肥大化を防ぐ「スライディングウィンドウ」または「トークン推計に基づく古いメッセージの刈り込み（Pruning）」機能を実装せよ。
+* 例えば、メッセージの総文字数が一定（例: 20,000文字）を超えた場合、システムプロンプトと最新の数ターンのみを残し、中間の中だるみした議論履歴を安全にDropしてLLMに送信するロジックを `src/agents/mod.rs` の `build_messages` メソッドに組み込め。
 
-## 2. 仕様駆動開発（SDD）に基づく要件定義
+## 3. テスト駆動開発 (TDD) に基づく実装ステップ
 
-本システムの堅牢性を担保するため、以下の仕様を満たすこと。
+作業は以下の順序で進め、各ステップでテストがパスすることを保証してください。
 
-**仕様 1: ステートマシンの拡張 (Rust)**
+1.  **Fail Testsの作成 (Red):**
+    * LLMが「これは素晴らしい設計ですが、以下の点でRejectします。」と出力したテキストを食わせた際、誤ってApproveと判定されず、正しく `Reject` としてパースされるテストを書け。
+    * 大量のダミーメッセージを `ContextGraph` に追加した際、`build_messages` が一定の長さ（または要素数）以上の履歴を切り詰めて出力するテストを書け。
+2.  **型とドメインの堅牢化 (Green):**
+    * 要件A, B, C の実装を行い、テストを通過させよ。
+    * LLMのストリームが空（Empty）で切断された場合でもパニックせず、`AppError::LlmStreamError` 等の適切なエラー型としてキャッチし、エスカレーションする安全網を組め。
+3.  **リファクタリング (Refactor):**
+    * `src/engine/mod.rs` 内のメインループがクリーンで可読性の高い状態になっているか監査し、必要であればリファクタリングせよ。
 
-* `Planning` フェーズは、外部情報の調査を伴う可能性があるため、`ToolCalling` 状態への一時的な遷移をドメインとして正式に許可する。
-* 変更対象: `src/domain/state.rs` の `can_transition_to` メソッド。
-
-**仕様 2: レポートファイルの永続化 (Bash)**
-
-* ベンチマークレポート（`benchmark_report.md`）は、ファイルが**存在しない場合のみ**ヘッダーを初期化し、存在する場合は追記（Append）を継続する仕様とする。
-
-**仕様 3: パイプライン・セーフな解析ロジック (Bash)**
-
-* ログの解析処理（`TOTAL_CHARS` の計算）において、検索対象の文字列が存在しなくてもスクリプトがクラッシュしない「パイプライン・セーフ」な実装を導入する。
-
----
-
-## 3. テスト駆動開発（TDD）に基づく実装手順
-
-AIコーダーは、以下のStep 1〜4の順序で厳格に実装とテストを行うこと。
-
-### Step 1: Rustドメイン層のテスト追加と実装
-
-1. **テストの記述 (Red):**
-`src/domain/state.rs` 内の `mod tests` にある `valid_transitions` テスト、または新規テスト `planning_to_toolcalling_transition` を作成し、以下をアサートせよ。
-```rust
-let tool_state = WorkflowState::ToolCalling { return_to: Box::new(WorkflowState::Planning) };
-assert!(WorkflowState::Planning.can_transition_to(&tool_state));
-
-```
-
-
-2. **実装 (Green):**
-同ファイル内の `can_transition_to` メソッドにおける `Planning` の遷移ルールに以下を追加せよ。
-```rust
-(WorkflowState::Planning, WorkflowState::ToolCalling { .. }) => true,
-
-```
-
-
-3. **検証 (Refactor):**
-`cargo test domain::state::tests` を実行し、テストがPASSすることを証明せよ。
-
-### Step 2: ベンチマークスクリプトの堅牢化 (1) - レポート初期化防止
-
-`scripts/benchmark_rtx3090.sh` の `Markdown Report Initialization` ブロック（41行目付近）を以下のように書き換えよ。
-
-```bash
-# --- Markdown Report Initialization ---
-if [[ ! -f "$REPORT_FILE" ]]; then
-    echo "# RTX 3090 Benchmark Results" > "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-    echo "| Model | Engine | Peak VRAM (MB) | Time (sec) | Approx System T/s | Status | Output Log |" >> "$REPORT_FILE"
-    echo "|---|---|---|---|---|---|---|" >> "$REPORT_FILE"
-else
-    echo "[INFO] Existing report file found. Appending results..."
-fi
-
-```
-
-### Step 3: ベンチマークスクリプトの堅牢化 (2) - パイプライン・セーフティ
-
-同スクリプト内の `TOTAL_CHARS` および `APPROX_TOKENS` の計算ブロック（135行目付近）を、`set -e` の監視下でも絶対に落ちないロジック（`if` 文による `grep -q` の事前チェック）に書き換えよ。
-
-```bash
-    # 安全な文字数カウント（パイプエラー回避）
-    TOTAL_CHARS=0
-    if grep -q '"type":"agent_spoke"' "$RAW_LOG" 2>/dev/null; then
-        TOTAL_CHARS=$(grep '"type":"agent_spoke"' "$RAW_LOG" | sed 's/data: //' | jq -r '.content' | wc -m)
-    fi
-    
-    # 欠損値対策
-    if [[ -z "$TOTAL_CHARS" || ! "$TOTAL_CHARS" =~ ^[0-9]+$ ]]; then
-        TOTAL_CHARS=0
-    fi
-    APPROX_TOKENS=$((TOTAL_CHARS / 4))
-
-```
-
-### Step 4: キャッシュの強制破棄と再ビルド
-
-コードの修正が完了したら、前回のように古いDockerイメージのキャッシュが効いてしまうのを防ぐため、必ず以下のコマンドを実行して最新のRustバイナリをコンテナにデプロイせよ。
-
-```bash
-docker compose -f docker-compose.bench.yml down -v || true
-docker rmi lean-agents-rs-lean-agents:latest -f || true
-docker compose -f docker-compose.bench.yml build --no-cache lean-agents
-
-```
-
-## 4. 完了条件
-
-* `cargo test` の全件PASS。
-* Orchestratorエージェントが `Planning` フェーズで正常に検索ツールを呼び出せること。
-* エージェントが発言せずにエスカレーションしてもスクリプトが異常終了せず、次のモデルのテストに正常に移行すること。
-* ベンチマーク結果がMarkdownファイルに追記され続けること。
-
-作業を開始してください。
+## 4. 完了条件と報告
+すべての実装とテスト（`cargo test`）が完了したら、どのようなロジックを用いて「すり抜け」と「コンテキスト溢れ」を根本から防いだのか、設計の意図を簡潔にまとめて報告せよ。
