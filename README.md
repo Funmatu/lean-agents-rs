@@ -2,6 +2,12 @@
 
 **ASUS GX10 (UMA) Optimized Multi-Agent Software Development System in Rust**
 
+
+<p align="center">
+  <img src="./docs/architecture.svg" width="100%" alt="lean-agents-rs アーキテクチャ図">
+</p>
+
+
 ---
 
 ## 1. Project Overview (プロジェクト概要)
