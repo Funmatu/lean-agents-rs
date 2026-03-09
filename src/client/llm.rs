@@ -121,7 +121,9 @@ impl SgLangClient {
                     let data = data.trim();
                     if data == "[DONE]" {
                         return if result.is_empty() {
-                            Err(AppError::LlmClient("stream completed with no content".to_string()))
+                            Err(AppError::LlmStreamError(
+                                "stream completed with no content (possible context overflow)".to_string(),
+                            ))
                         } else {
                             Ok(result)
                         };
@@ -145,7 +147,9 @@ impl SgLangClient {
 
         // Stream ended without [DONE] — return what we have
         if result.is_empty() {
-            Err(AppError::LlmClient("stream ended unexpectedly with no content".to_string()))
+            Err(AppError::LlmStreamError(
+                "stream ended unexpectedly with no content (possible context overflow)".to_string(),
+            ))
         } else {
             Ok(result)
         }

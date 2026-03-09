@@ -10,6 +10,7 @@ use crate::client::llm::{ChatCompletionRequest, ChatMessage, LlmClient};
 use crate::client::search::SearchClient;
 use crate::domain::agent::AgentRole;
 use crate::domain::context::ContextGraph;
+use crate::domain::decision::{self, ReviewDecision};
 use crate::domain::event::EngineEvent;
 use crate::domain::message::Message;
 use crate::domain::state::WorkflowState;
@@ -105,6 +106,10 @@ impl Engine {
         let mut design_iterations = 0u32;
         let mut review_iterations = 0u32;
         let mut just_compressed = false;
+
+        // Set context pruning budget so build_messages() can trim old messages
+        // before sending to LLM, preventing context overflow at the API level.
+        context.set_max_context_chars(max_context_length);
 
         loop {
             tokio::select! {
@@ -234,21 +239,38 @@ impl Engine {
                             }).await;
                             context.add_message(Message::new(AgentRole::DevilsAdvocate, &review));
 
-                            if parser::is_approval(&review) {
-                                info!("Design approved by DevilsAdvocate");
-                                let from = context.state().clone();
-                                context.transition_to(WorkflowState::Implementing)?;
-                                Self::emit(tx, EngineEvent::StateChanged {
-                                    from,
-                                    to: WorkflowState::Implementing,
-                                }).await;
-                                info!("Designing -> Implementing");
-                                Ok(false)
-                            } else {
-                                design_iterations += 1;
-                                info!("Design iteration {}: revision requested", design_iterations);
-                                Ok(false)
+                            // Strict decision gate: only Approve allows transition.
+                            // "Last keyword wins" prevents false positives when
+                            // both approve/reject appear in the same response.
+                            match decision::parse_review_decision(&review) {
+                                ReviewDecision::Approve => {
+                                    info!("Design approved by DevilsAdvocate");
+                                    let from = context.state().clone();
+                                    context.transition_to(WorkflowState::Implementing)?;
+                                    Self::emit(tx, EngineEvent::StateChanged {
+                                        from,
+                                        to: WorkflowState::Implementing,
+                                    }).await;
+                                    info!("Designing -> Implementing");
+                                }
+                                ReviewDecision::Reject(reason) => {
+                                    design_iterations += 1;
+                                    info!(
+                                        "Design iteration {}: rejected — {}",
+                                        design_iterations,
+                                        reason
+                                    );
+                                }
+                                ReviewDecision::RequestRevision(reason) => {
+                                    design_iterations += 1;
+                                    info!(
+                                        "Design iteration {}: revision requested — {}",
+                                        design_iterations,
+                                        reason
+                                    );
+                                }
                             }
+                            Ok(false)
                         }
                         WorkflowState::Implementing => {
                             Self::emit(tx, EngineEvent::AgentThinking {
@@ -307,28 +329,49 @@ impl Engine {
                             }).await;
                             context.add_message(Message::new(AgentRole::DevilsAdvocate, &review));
 
-                            if parser::is_approval(&review) {
-                                info!("Implementation approved by DevilsAdvocate");
-                                let from = context.state().clone();
-                                context.transition_to(WorkflowState::Completed)?;
-                                Self::emit(tx, EngineEvent::StateChanged {
-                                    from,
-                                    to: WorkflowState::Completed,
-                                }).await;
-                                Self::emit(tx, EngineEvent::WorkflowCompleted).await;
-                                info!("Workflow completed successfully");
-                                Ok(false)
-                            } else {
-                                let from = context.state().clone();
-                                context.transition_to(WorkflowState::Implementing)?;
-                                Self::emit(tx, EngineEvent::StateChanged {
-                                    from,
-                                    to: WorkflowState::Implementing,
-                                }).await;
-                                review_iterations += 1;
-                                info!("Review iteration {}: rework requested", review_iterations);
-                                Ok(false)
+                            // Strict decision gate: only Approve completes the workflow.
+                            match decision::parse_review_decision(&review) {
+                                ReviewDecision::Approve => {
+                                    info!("Implementation approved by DevilsAdvocate");
+                                    let from = context.state().clone();
+                                    context.transition_to(WorkflowState::Completed)?;
+                                    Self::emit(tx, EngineEvent::StateChanged {
+                                        from,
+                                        to: WorkflowState::Completed,
+                                    }).await;
+                                    Self::emit(tx, EngineEvent::WorkflowCompleted).await;
+                                    info!("Workflow completed successfully");
+                                }
+                                ReviewDecision::Reject(reason) => {
+                                    let from = context.state().clone();
+                                    context.transition_to(WorkflowState::Implementing)?;
+                                    Self::emit(tx, EngineEvent::StateChanged {
+                                        from,
+                                        to: WorkflowState::Implementing,
+                                    }).await;
+                                    review_iterations += 1;
+                                    info!(
+                                        "Review iteration {}: rejected — {}",
+                                        review_iterations,
+                                        reason
+                                    );
+                                }
+                                ReviewDecision::RequestRevision(reason) => {
+                                    let from = context.state().clone();
+                                    context.transition_to(WorkflowState::Implementing)?;
+                                    Self::emit(tx, EngineEvent::StateChanged {
+                                        from,
+                                        to: WorkflowState::Implementing,
+                                    }).await;
+                                    review_iterations += 1;
+                                    info!(
+                                        "Review iteration {}: revision requested — {}",
+                                        review_iterations,
+                                        reason
+                                    );
+                                }
                             }
+                            Ok(false)
                         }
                         WorkflowState::Escalated => {
                             // Escalation is now fully handled inline by handle_escalation().
@@ -443,7 +486,30 @@ impl Engine {
         let mut parse_retries = 0u32;
 
         loop {
-            let raw = agent.execute(context, llm).await?;
+            let raw = match agent.execute(context, llm).await {
+                Ok(r) => r,
+                Err(AppError::LlmStreamError(reason)) => {
+                    warn!(
+                        "Agent {:?} LLM stream error: {}, escalating",
+                        agent.role(),
+                        reason
+                    );
+                    context.clear_volatile_context();
+                    Self::handle_escalation(
+                        context,
+                        tx,
+                        active_interventions.clone(),
+                        &format!(
+                            "LLM stream error for agent {:?}: {}",
+                            agent.role(),
+                            reason
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             let output = match parser::parse_agent_output(&raw) {
                 Ok(parsed) => {
@@ -927,6 +993,106 @@ mod tests {
         ).await;
 
         assert!(result.is_ok(), "Should not hang in infinite loop");
+        assert_eq!(*ctx.state(), WorkflowState::Completed);
+    }
+
+    /// Regression test: DevilsAdvocate output contains both "approve" and "reject"
+    /// keywords. The old `is_approval` (simple `contains("approve")`) would
+    /// incorrectly treat this as approval. The new `ReviewDecision` parser uses
+    /// "last keyword wins" — since "reject" appears after "approve", this must
+    /// NOT transition to Implementing.
+    #[tokio::test]
+    async fn approve_then_reject_does_not_leak_to_implementing() {
+        let llm = MockLlmClient::new(vec![
+            "Plan: build an API".into(),
+            "Design: use axum".into(),
+            // The critical mixed output — "approve" appears but "reject" is last
+            "This is a wonderful design and I would normally approve it, \
+             but after careful consideration I must reject it due to missing auth."
+                .into(),
+            // Second design attempt
+            "Design v2: use axum with auth middleware".into(),
+            // Clean approve
+            "Approve - design is now solid".into(),
+            "Implementation complete".into(),
+            "Approve - LGTM".into(),
+        ]);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+        let (tx, rx) = event_channel();
+
+        let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
+        engine
+            .run(
+                &mut ctx, &llm, &search, "Build an API",
+                &tx, tokio_util::sync::CancellationToken::new(),
+                dummy_interventions, usize::MAX,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*ctx.state(), WorkflowState::Completed);
+
+        // Verify the state transition sequence: should have TWO Designing phases
+        // (one rejected, one approved) before reaching Implementing.
+        let events = collect_events(rx).await;
+        let state_changes: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let EngineEvent::StateChanged { to, .. } = e {
+                    Some(to.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // The rejected review should NOT have produced a Designing→Implementing transition
+        // after the first DA response. It should stay in Designing for the second attempt.
+        let impl_count = state_changes
+            .iter()
+            .filter(|s| matches!(s, WorkflowState::Implementing))
+            .count();
+        assert_eq!(
+            impl_count, 1,
+            "Should transition to Implementing exactly once (after clean approve), got transitions: {:?}",
+            state_changes
+        );
+    }
+
+    /// Test that ambiguous output (no approve/reject keywords) is treated
+    /// as a revision request, NOT as approval.
+    #[tokio::test]
+    async fn ambiguous_review_does_not_approve() {
+        let mut responses = vec![
+            "Plan: build it".to_string(),
+            "Design: simple approach".into(),
+            // Ambiguous: no approve/reject keyword
+            "The design has some interesting ideas but needs more thought on error handling.".into(),
+        ];
+        // After the ambiguous review, provide a proper second round
+        responses.push("Design v2: with error handling".into());
+        responses.push("Approve - much better".into());
+        responses.push("Code complete".into());
+        responses.push("Approve - ship it".into());
+
+        let llm = MockLlmClient::new(responses);
+        let search = MockSearchClient::new(vec![]);
+        let mut ctx = ContextGraph::new();
+        let engine = Engine::new();
+        let (tx, _rx) = event_channel();
+
+        let dummy_interventions = std::sync::Arc::new(dashmap::DashMap::new());
+        engine
+            .run(
+                &mut ctx, &llm, &search, "Test ambiguous",
+                &tx, tokio_util::sync::CancellationToken::new(),
+                dummy_interventions, usize::MAX,
+            )
+            .await
+            .unwrap();
+
         assert_eq!(*ctx.state(), WorkflowState::Completed);
     }
 }

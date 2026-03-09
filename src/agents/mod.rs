@@ -19,12 +19,16 @@ pub trait Agent: Send + Sync {
 
     /// Build the full message array for the LLM, respecting RadixAttention:
     /// 1. System prompt (immutable prefix — cached by SGLang)
-    /// 2. Message history (grows monotonically — prefix-cacheable across turns)
+    /// 2. Message history (pruned to fit context budget, prefix-cacheable)
     /// 3. Volatile context (ephemeral, tail position — never invalidates prefix cache)
+    ///
+    /// When `ContextGraph::max_context_chars` is set, older messages are pruned
+    /// to keep the total within budget. System checkpoint summaries are always
+    /// preserved to maintain critical context.
     fn build_messages(&self, context: &ContextGraph) -> Vec<ChatMessage> {
-        let history_len = context.messages().len();
+        let pruned = context.pruned_messages();
         let volatile_present = context.volatile_context().is_some();
-        let capacity = 1 + history_len + volatile_present as usize;
+        let capacity = 1 + pruned.len() + volatile_present as usize;
         let mut messages = Vec::with_capacity(capacity);
 
         // 1. System prompt (stable prefix for RadixAttention / Prefix Caching)
@@ -33,9 +37,9 @@ pub trait Agent: Send + Sync {
             content: self.system_prompt().to_string(),
         });
 
-        // 2. Message history — monotonically growing, maximizes prefix cache hits
+        // 2. Message history — pruned to budget, maximizes prefix cache hits
         let my_role = self.role();
-        for msg in context.messages() {
+        for msg in &pruned {
             let role = if msg.sender == my_role { "assistant" } else { "user" };
             messages.push(ChatMessage {
                 role: role.into(),

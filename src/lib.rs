@@ -25,6 +25,9 @@ pub mod error {
         #[error("Parse error: {0}")]
         Parse(String),
 
+        #[error("LLM stream error: {0}")]
+        LlmStreamError(String),
+
         #[error("Invalid state transition: {0}")]
         InvalidTransition(#[from] crate::domain::state::InvalidTransition),
 
