@@ -29,4 +29,10 @@ impl Agent for DevilsAdvocateAgent {
     fn system_prompt(&self) -> &str {
         SYSTEM_PROMPT
     }
+
+    /// Moderate-low temperature: review decisions (approve/reject) must be
+    /// reliable and consistent, while retaining enough variance to catch
+    /// non-obvious issues. Lower than default to reduce false-positive
+    /// keyword ambiguity in decision parsing.
+    fn temperature(&self) -> f32 { 0.5 }
 }

@@ -28,4 +28,12 @@ impl Agent for ProgrammerAgent {
     fn system_prompt(&self) -> &str {
         SYSTEM_PROMPT
     }
+
+    /// Low temperature: code generation demands precision and correctness
+    /// over creativity. Minimizes hallucinated APIs and syntax errors.
+    fn temperature(&self) -> f32 { 0.3 }
+
+    /// Higher token budget: code output is inherently longer than prose.
+    /// Prevents truncated implementations.
+    fn max_tokens(&self) -> u32 { 4096 }
 }

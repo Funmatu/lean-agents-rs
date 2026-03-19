@@ -30,4 +30,8 @@ impl Agent for OrchestratorAgent {
     fn system_prompt(&self) -> &str {
         SYSTEM_PROMPT
     }
+
+    /// Low temperature: planning and delegation require deterministic,
+    /// focused output. Reduces token waste on tangential reasoning.
+    fn temperature(&self) -> f32 { 0.3 }
 }

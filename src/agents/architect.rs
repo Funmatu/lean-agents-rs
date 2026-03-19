@@ -28,4 +28,8 @@ impl Agent for ArchitectAgent {
     fn system_prompt(&self) -> &str {
         SYSTEM_PROMPT
     }
+
+    /// Moderate temperature: design requires creativity for novel solutions
+    /// while staying grounded in feasibility.
+    fn temperature(&self) -> f32 { 0.6 }
 }

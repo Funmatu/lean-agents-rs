@@ -17,6 +17,13 @@ pub trait Agent: Send + Sync {
     fn role(&self) -> AgentRole;
     fn system_prompt(&self) -> &str;
 
+    /// Sampling temperature. Lower = more deterministic.
+    /// Override per agent to match the role's needs.
+    fn temperature(&self) -> f32 { 0.7 }
+
+    /// Maximum output tokens. Override for roles that produce longer outputs.
+    fn max_tokens(&self) -> u32 { 2048 }
+
     /// Build the full message array for the LLM, respecting RadixAttention:
     /// 1. System prompt (immutable prefix — cached by SGLang)
     /// 2. Message history (pruned to fit context budget, prefix-cacheable)
@@ -85,8 +92,8 @@ pub trait Agent: Send + Sync {
         let request = ChatCompletionRequest {
             model: String::new(), // Overridden by client
             messages,
-            temperature: Some(0.7),
-            max_tokens: Some(2048),
+            temperature: Some(self.temperature()),
+            max_tokens: Some(self.max_tokens()),
             stream: None, // Controlled by client implementation
         };
         llm.chat_completion(request).await
